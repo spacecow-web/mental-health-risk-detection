@@ -49,6 +49,15 @@ export interface TokenAttribution {
   end?: number;
 }
 
+export interface PhraseAttribution {
+  phrase: string;
+  weight: number;
+  direction: 'supporting' | 'opposing' | 'neutral';
+  start: number;
+  end: number;
+  tokens: string[];
+}
+
 export interface InferenceExplanationBundle {
   source: 'local-api' | 'imported-json';
   modelName: string;
@@ -63,6 +72,7 @@ export interface InferenceExplanationBundle {
   tokens: string[];
   method: ExplanationMethod;
   attributions: TokenAttribution[];
+  phraseAttributions?: PhraseAttribution[];
   naturalLanguageSummary: string;
   supportiveGuidance: boolean;
   confidenceDisclaimer?: string;

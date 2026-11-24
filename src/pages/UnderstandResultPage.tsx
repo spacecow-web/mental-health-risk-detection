@@ -68,7 +68,11 @@ export function UnderstandResultPage({
             Your words with standout phrases softly highlighted
           </div>
           <div className="neu-inset p-4 text-sm leading-loose whitespace-pre-wrap break-words text-[#203653]">
-            {buildGentleHighlightSegments(analyzedText, activeBundle.attributions).map((seg, idx) =>
+            {buildGentleHighlightSegments(
+              analyzedText,
+              activeBundle.attributions,
+              activeBundle.phraseAttributions
+            ).map((seg, idx) =>
               seg.highlighted ? (
                 <mark
                   key={`seg-${idx}`}

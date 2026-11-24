@@ -108,6 +108,9 @@ export function CheckTextPage({
         tokens: Array.isArray(data.tokens) ? data.tokens : tokenPreview.tokens,
         method: data.method === 'LIME' ? 'LIME' : 'SHAP',
         attributions: Array.isArray(data.attributions) ? data.attributions : [],
+        phraseAttributions: Array.isArray(data.phrase_attributions)
+          ? data.phrase_attributions
+          : undefined,
         naturalLanguageSummary: String(data.natural_language_summary || ''),
         supportiveGuidance: Boolean(data.supportive_guidance),
         confidenceDisclaimer: data.confidence_disclaimer || undefined,

@@ -8,8 +8,11 @@ import type {
   InferenceExplanationBundle,
   PageId,
   PreprocessingOptions,
-  TokenAttribution,
 } from '@/src/types/mindtrace';
+import {
+  filterAndNormalizeAttributions,
+  groupMeaningfulPhrases,
+} from '@/src/utils/explanationFilter';
 import {
   buildGroundedExplanationSummary,
   detectImmediateSelfHarmCues,
@@ -26,33 +29,49 @@ interface ExplainableAIPageProps {
 }
 
 type PolarityFilter = 'all' | 'supporting' | 'opposing';
+type GranularityView = 'phrases' | 'words';
+
+interface DisplayAttribution {
+  label: string;
+  weight: number;
+  direction: 'supporting' | 'opposing' | 'neutral';
+  start?: number;
+  end?: number;
+}
 
 function buildHighlightedTextNodes(
   text: string,
-  attributions: TokenAttribution[],
+  items: DisplayAttribution[],
   maxAbsWeight: number
 ): ReactNode[] {
   if (!text) return [];
 
-  const withOffsets = attributions
+  const salient = items.filter((a) => a.direction !== 'neutral');
+  if (salient.length === 0) {
+    return [<span key="plain-text">{text}</span>];
+  }
+
+  const withOffsets = salient
     .filter((a) => typeof a.start === 'number' && typeof a.end === 'number')
     .sort((a, b) => (a.start ?? 0) - (b.start ?? 0));
 
-  const resolvedSpans: { start: number; end: number; attr: TokenAttribution }[] = [];
+  const resolvedSpans: { start: number; end: number; attr: DisplayAttribution }[] = [];
 
   if (withOffsets.length > 0) {
     for (const attr of withOffsets) {
       const s = attr.start!;
       const e = attr.end!;
       if (s >= 0 && e <= text.length && s < e) {
+        const prev = resolvedSpans[resolvedSpans.length - 1];
+        if (prev && s < prev.end) continue;
         resolvedSpans.push({ start: s, end: e, attr });
       }
     }
   } else {
     let cursor = 0;
     const lowered = text.toLowerCase();
-    for (const attr of attributions) {
-      const cleanTok = attr.token.replace(/^##/, '');
+    for (const attr of salient) {
+      const cleanTok = attr.label.replace(/^##/, '').trim();
       if (!cleanTok) continue;
       let idx = text.indexOf(cleanTok, cursor);
       if (idx === -1) {
@@ -79,34 +98,28 @@ function buildHighlightedTextNodes(
     }
 
     const slice = text.slice(span.start, span.end);
-    const { weight } = span.attr;
-    const isSup = weight > 1e-4;
-    const isOpp = weight < -1e-4;
+    const { weight, direction } = span.attr;
+    const isSup = direction === 'supporting';
+    const norm = Math.min(Math.abs(weight) / maxAbsWeight, 1);
+    const alpha = 0.24 + 0.36 * norm;
+    const bg = isSup
+      ? `rgba(119, 153, 216, ${alpha.toFixed(2)})`
+      : `rgba(217, 149, 165, ${alpha.toFixed(2)})`;
+    const borderColor = isSup ? '#4D6FAF' : '#B86B7E';
 
-    if (!isSup && !isOpp) {
-      nodes.push(<span key={`neutral-${idx}`}>{slice}</span>);
-    } else {
-      const norm = Math.min(Math.abs(weight) / maxAbsWeight, 1);
-      const alpha = 0.24 + 0.36 * norm;
-      const bg = isSup
-        ? `rgba(119, 153, 216, ${alpha.toFixed(2)})`
-        : `rgba(217, 149, 165, ${alpha.toFixed(2)})`;
-      const borderColor = isSup ? '#4D6FAF' : '#B86B7E';
-
-      nodes.push(
-        <mark
-          key={`hl-${idx}`}
-          title={`${slice}: ${weight >= 0 ? '+' : ''}${weight.toFixed(4)} (${span.attr.direction})`}
-          style={{
-            backgroundColor: bg,
-            borderBottom: `2px solid ${borderColor}`,
-          }}
-          className="rounded-md px-1.5 py-0.5 text-[#172840]"
-        >
-          {slice}
-        </mark>
-      );
-    }
+    nodes.push(
+      <mark
+        key={`hl-${idx}`}
+        title={`${slice}: ${weight >= 0 ? '+' : ''}${weight.toFixed(4)} (${direction})`}
+        style={{
+          backgroundColor: bg,
+          borderBottom: `2px solid ${borderColor}`,
+        }}
+        className="rounded-md px-1.5 py-0.5 text-[#172840]"
+      >
+        {slice}
+      </mark>
+    );
 
     pos = span.end;
   });
@@ -127,42 +140,75 @@ export function ExplainableAIPage({
   embedded = false,
 }: ExplainableAIPageProps) {
   const [polarityFilter, setPolarityFilter] = useState<PolarityFilter>('all');
+  const [granularity, setGranularity] = useState<GranularityView>('phrases');
   const [topK, setTopK] = useState<number>(12);
   const [recomputingMethod, setRecomputingMethod] = useState<ExplanationMethod | null>(null);
   const [recomputeError, setRecomputeError] = useState<string | null>(null);
 
-  const rankedAttributions = useMemo(() => {
+  const normalizedWordAttributions = useMemo(() => {
     if (!activeBundle) return [];
-    const filtered = activeBundle.attributions.filter((item) => {
-      if (polarityFilter === 'supporting') return item.weight > 1e-4;
-      if (polarityFilter === 'opposing') return item.weight < -1e-4;
-      return true;
+    return filterAndNormalizeAttributions(activeBundle.attributions);
+  }, [activeBundle]);
+
+  const phraseAttributions = useMemo(() => {
+    if (!activeBundle) return [];
+    if (activeBundle.phraseAttributions && activeBundle.phraseAttributions.length > 0) {
+      return activeBundle.phraseAttributions;
+    }
+    const textForGrouping = activeBundle.cleanedText || activeBundle.originalText || '';
+    return groupMeaningfulPhrases(textForGrouping, normalizedWordAttributions);
+  }, [activeBundle, normalizedWordAttributions]);
+
+  const activeDisplayItems: DisplayAttribution[] = useMemo(() => {
+    if (granularity === 'phrases' && phraseAttributions.length > 0) {
+      return phraseAttributions.map((p) => ({
+        label: p.phrase,
+        weight: p.weight,
+        direction: p.direction,
+        start: p.start,
+        end: p.end,
+      }));
+    }
+    return normalizedWordAttributions
+      .filter((a) => a.direction !== 'neutral')
+      .map((a) => ({
+        label: a.token,
+        weight: a.weight,
+        direction: a.direction,
+        start: a.start,
+        end: a.end,
+      }));
+  }, [granularity, phraseAttributions, normalizedWordAttributions]);
+
+  const rankedAttributions = useMemo(() => {
+    const filtered = activeDisplayItems.filter((item) => {
+      if (polarityFilter === 'supporting') return item.direction === 'supporting';
+      if (polarityFilter === 'opposing') return item.direction === 'opposing';
+      return item.direction !== 'neutral';
     });
     return [...filtered]
       .sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight))
       .slice(0, topK);
-  }, [activeBundle, polarityFilter, topK]);
+  }, [activeDisplayItems, polarityFilter, topK]);
 
   const supportingPhrases = useMemo(() => {
-    if (!activeBundle) return [];
-    return [...activeBundle.attributions]
-      .filter((a) => a.weight > 1e-4)
+    return [...activeDisplayItems]
+      .filter((a) => a.direction === 'supporting')
       .sort((a, b) => b.weight - a.weight)
       .slice(0, 6);
-  }, [activeBundle]);
+  }, [activeDisplayItems]);
 
   const opposingPhrases = useMemo(() => {
-    if (!activeBundle) return [];
-    return [...activeBundle.attributions]
-      .filter((a) => a.weight < -1e-4)
+    return [...activeDisplayItems]
+      .filter((a) => a.direction === 'opposing')
       .sort((a, b) => a.weight - b.weight)
       .slice(0, 6);
-  }, [activeBundle]);
+  }, [activeDisplayItems]);
 
   const maxAbsWeight = useMemo(() => {
-    if (!activeBundle || activeBundle.attributions.length === 0) return 1;
-    return Math.max(...activeBundle.attributions.map((a) => Math.abs(a.weight)), 1e-6);
-  }, [activeBundle]);
+    if (activeDisplayItems.length === 0) return 1;
+    return Math.max(...activeDisplayItems.map((a) => Math.abs(a.weight)), 1e-6);
+  }, [activeDisplayItems]);
 
   async function handleRecomputeMethod(method: ExplanationMethod) {
     if (!activeBundle) return;
@@ -213,6 +259,9 @@ export function ExplainableAIPage({
         tokens: Array.isArray(data.tokens) ? data.tokens : activeBundle.tokens,
         method: data.method === 'LIME' ? 'LIME' : 'SHAP',
         attributions: Array.isArray(data.attributions) ? data.attributions : [],
+        phraseAttributions: Array.isArray(data.phrase_attributions)
+          ? data.phrase_attributions
+          : undefined,
         naturalLanguageSummary: String(data.natural_language_summary || ''),
         supportiveGuidance: Boolean(data.supportive_guidance),
         confidenceDisclaimer: data.confidence_disclaimer || undefined,
@@ -247,7 +296,7 @@ export function ExplainableAIPage({
       {!embedded ? (
         <PageHeader
           title="Explainable AI"
-          description="Inspect how SHAP and LIME measure which words in the latest analyzed text influenced the active Transformer model's prediction."
+          description="Inspect how SHAP and LIME measure which meaningful words and phrases in the latest analyzed text influenced the active Transformer model's prediction."
           action={
             activeBundle && canLiveRecompute ? (
               <div className="neu-inset inline-flex items-center gap-1.5 rounded-2xl p-1.5">
@@ -280,7 +329,7 @@ export function ExplainableAIPage({
           <div className="flex flex-wrap items-center justify-between gap-3 neu-card p-5">
             <div>
               <h3 className="font-display text-sm font-semibold text-[#203653]">
-                Live Token Attribution Inspector
+                Live Token &amp; Phrase Attribution Inspector
               </h3>
               <p className="text-xs text-[#526783]">
                 Switch between Partition SHAP and LIME on your latest analyzed message.
@@ -330,7 +379,7 @@ export function ExplainableAIPage({
           </h2>
           <p className="mt-2 text-sm leading-relaxed text-[#526783]">
             Submit text on the Text Analysis page using the active Transformer model. SHAP or LIME
-            word-level attributions and highlighted text will appear here automatically.
+            meaningful attributions and highlighted text will appear here automatically.
           </p>
 
           <div className="mt-6">
@@ -346,7 +395,7 @@ export function ExplainableAIPage({
         </section>
       ) : (
         <>
-          {/* 1. Original Submitted Text + 2. Highlighted Influential Words */}
+          {/* 1. Original Submitted Text + 2. Highlighted Influential Words / Phrases */}
           <div className="grid gap-6 lg:grid-cols-12">
             <section className="lg:col-span-5 neu-card p-6 space-y-3">
               <div className="flex items-center justify-between">
@@ -371,9 +420,30 @@ export function ExplainableAIPage({
             <section className="lg:col-span-7 neu-card-elevated p-6 space-y-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <h2 className="font-display text-base font-semibold text-[#203653]">
-                  Highlighted Influential Words
+                  Highlighted Influential Expressions
                 </h2>
-                <div className="flex items-center gap-4 text-xs text-[#526783]">
+                <div className="flex flex-wrap items-center gap-3 text-xs text-[#526783]">
+                  <div className="neu-inset inline-flex rounded-2xl p-1 gap-1">
+                    {(
+                      [
+                        ['phrases', 'Phrases'],
+                        ['words', 'Key Words'],
+                      ] as [GranularityView, string][]
+                    ).map(([val, lbl]) => (
+                      <button
+                        key={val}
+                        type="button"
+                        onClick={() => setGranularity(val)}
+                        className={`rounded-xl px-2.5 py-1 text-[11px] font-medium transition-all ${
+                          granularity === val
+                            ? 'neu-btn-accent text-[#203653]'
+                            : 'text-[#526783] hover:text-[#203653]'
+                        }`}
+                      >
+                        {lbl}
+                      </button>
+                    ))}
+                  </div>
                   <span className="inline-flex items-center gap-1.5">
                     <span
                       className="inline-block h-3 w-3 rounded"
@@ -398,16 +468,18 @@ export function ExplainableAIPage({
               </div>
 
               <div className="neu-inset p-4 text-sm leading-loose whitespace-pre-wrap break-words text-[#203653]">
-                {buildHighlightedTextNodes(analyzedText, activeBundle.attributions, maxAbsWeight)}
+                {buildHighlightedTextNodes(analyzedText, activeDisplayItems, maxAbsWeight)}
               </div>
               <p className="text-[11px] text-[#526783]">
-                Hover over any highlighted word to inspect its exact attribution weight toward{' '}
+                Standalone grammatical filler words are excluded from highlights while keeping
+                negations, contractions, and full phrases intact. Hover over any highlighted span
+                to inspect its attribution weight toward{' '}
                 <span className="font-semibold text-[#203653]">{activeBundle.predictedLabel}</span>.
               </p>
             </section>
           </div>
 
-          {/* 3. Feature Importance Horizontal Bar Chart + Word Lists */}
+          {/* 3. Feature Importance Horizontal Bar Chart + Word/Phrase Lists */}
           <div className="grid gap-6 lg:grid-cols-12">
             <section className="lg:col-span-7 neu-card p-6 space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-3">
@@ -416,7 +488,8 @@ export function ExplainableAIPage({
                     Feature Importance Chart (Top {rankedAttributions.length})
                   </h2>
                   <p className="text-xs text-[#526783]">
-                    Horizontal diverging bar chart showing positive (+) and negative (-) contributions.
+                    Horizontal diverging bar chart showing meaningful positive (+) and negative (-)
+                    contributions above the adaptive threshold.
                   </p>
                 </div>
 
@@ -462,62 +535,69 @@ export function ExplainableAIPage({
               </div>
 
               <div className="space-y-2.5 pt-1">
-                {rankedAttributions.map((item, idx) => {
-                  const widthPct = Math.min((Math.abs(item.weight) / maxAbsWeight) * 50, 50);
-                  const isPositive = item.weight >= 0;
-                  return (
-                    <div
-                      key={`${item.token}-${idx}`}
-                      className="grid grid-cols-12 items-center gap-2 text-xs"
-                    >
-                      <div className="col-span-3 truncate font-mono text-[#203653]" title={item.token}>
-                        {item.token}
+                {rankedAttributions.length === 0 ? (
+                  <div className="neu-inset p-4 text-xs text-[#526783]">
+                    No meaningful words or phrases crossed the adaptive significance threshold for
+                    this filter.
+                  </div>
+                ) : (
+                  rankedAttributions.map((item, idx) => {
+                    const widthPct = Math.min((Math.abs(item.weight) / maxAbsWeight) * 50, 50);
+                    const isPositive = item.weight >= 0;
+                    return (
+                      <div
+                        key={`${item.label}-${idx}`}
+                        className="grid grid-cols-12 items-center gap-2 text-xs"
+                      >
+                        <div className="col-span-4 truncate font-mono text-[#203653]" title={item.label}>
+                          {item.label}
+                        </div>
+                        <div className="col-span-6 relative h-5 neu-inset rounded-full flex items-center overflow-hidden">
+                          <div className="absolute left-1/2 top-0 bottom-0 w-px bg-[#7799D8]/70" />
+                          <div
+                            className="absolute h-3 rounded-full"
+                            style={
+                              isPositive
+                                ? {
+                                    left: '50%',
+                                    width: `${widthPct}%`,
+                                    background: 'linear-gradient(90deg, #7799D8, #4D6FAF)',
+                                  }
+                                : {
+                                    right: '50%',
+                                    width: `${widthPct}%`,
+                                    background: 'linear-gradient(90deg, #C77A8D, #D995A5)',
+                                  }
+                            }
+                          />
+                        </div>
+                        <div className="col-span-2 text-right font-mono tabular-nums text-[#526783]">
+                          {item.weight >= 0 ? '+' : ''}
+                          {item.weight.toFixed(4)}
+                        </div>
                       </div>
-                      <div className="col-span-7 relative h-5 neu-inset rounded-full flex items-center overflow-hidden">
-                        <div className="absolute left-1/2 top-0 bottom-0 w-px bg-[#7799D8]/70" />
-                        <div
-                          className="absolute h-3 rounded-full"
-                          style={
-                            isPositive
-                              ? {
-                                  left: '50%',
-                                  width: `${widthPct}%`,
-                                  background: 'linear-gradient(90deg, #7799D8, #4D6FAF)',
-                                }
-                              : {
-                                  right: '50%',
-                                  width: `${widthPct}%`,
-                                  background: 'linear-gradient(90deg, #C77A8D, #D995A5)',
-                                }
-                          }
-                        />
-                      </div>
-                      <div className="col-span-2 text-right font-mono tabular-nums text-[#526783]">
-                        {item.weight >= 0 ? '+' : ''}
-                        {item.weight.toFixed(4)}
-                      </div>
-                    </div>
-                  );
-                })}
+                    );
+                  })
+                )}
               </div>
             </section>
 
             <section className="lg:col-span-5 neu-card p-6 space-y-5">
               <div>
                 <h3 className="font-display text-sm font-semibold text-[#2E5894]">
-                  Strongest Supporting Words (+)
+                  Strongest Supporting Expressions (+)
                 </h3>
                 <div className="mt-2.5 space-y-2">
                   {supportingPhrases.length === 0 ? (
-                    <p className="text-xs text-[#526783]">None above threshold.</p>
+                    <p className="text-xs text-[#526783]">None above adaptive threshold.</p>
                   ) : (
                     supportingPhrases.map((item, i) => (
                       <div
-                        key={`${item.token}-sup-${i}`}
-                        className="neu-inset flex justify-between px-3.5 py-2 text-xs"
+                        key={`${item.label}-sup-${i}`}
+                        className="neu-inset flex justify-between gap-2 px-3.5 py-2 text-xs"
                       >
-                        <span className="font-mono text-[#203653]">{item.token}</span>
-                        <span className="font-mono tabular-nums font-semibold text-[#2E5894]">
+                        <span className="font-mono text-[#203653]">{item.label}</span>
+                        <span className="font-mono tabular-nums font-semibold text-[#2E5894] shrink-0">
                           +{item.weight.toFixed(4)}
                         </span>
                       </div>
@@ -528,19 +608,19 @@ export function ExplainableAIPage({
 
               <div className="border-t border-[#AFC5F5]/55 pt-4">
                 <h3 className="font-display text-sm font-semibold text-[#96475B]">
-                  Strongest Opposing Words (-)
+                  Strongest Opposing Expressions (-)
                 </h3>
                 <div className="mt-2.5 space-y-2">
                   {opposingPhrases.length === 0 ? (
-                    <p className="text-xs text-[#526783]">None above threshold.</p>
+                    <p className="text-xs text-[#526783]">None above adaptive threshold.</p>
                   ) : (
                     opposingPhrases.map((item, i) => (
                       <div
-                        key={`${item.token}-opp-${i}`}
-                        className="neu-inset flex justify-between px-3.5 py-2 text-xs"
+                        key={`${item.label}-opp-${i}`}
+                        className="neu-inset flex justify-between gap-2 px-3.5 py-2 text-xs"
                       >
-                        <span className="font-mono text-[#203653]">{item.token}</span>
-                        <span className="font-mono tabular-nums font-semibold text-[#96475B]">
+                        <span className="font-mono text-[#203653]">{item.label}</span>
+                        <span className="font-mono tabular-nums font-semibold text-[#96475B] shrink-0">
                           {item.weight.toFixed(4)}
                         </span>
                       </div>
@@ -566,7 +646,7 @@ export function ExplainableAIPage({
                   activeBundle.method,
                   activeBundle.predictedLabel,
                   activeBundle.confidence,
-                  activeBundle.attributions
+                  normalizedWordAttributions
                 )}
             </p>
             <div className="neu-inset p-4 text-xs leading-relaxed text-[#526783]">

@@ -109,6 +109,17 @@ def analyze(req: AnalyzeRequest) -> Dict[str, object]:
             }
             for a in report.attributions
         ],
+        "phrase_attributions": [
+            {
+                "phrase": p.phrase,
+                "weight": p.weight,
+                "direction": p.direction,
+                "start": p.start,
+                "end": p.end,
+                "tokens": p.tokens,
+            }
+            for p in report.phrase_attributions
+        ],
         "natural_language_summary": report.natural_language_summary,
         "immediate_safety": detect_immediate_self_harm_cues(req.text),
         "supportive_guidance": should_show_supportive_guidance(

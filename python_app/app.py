@@ -508,6 +508,17 @@ def main() -> None:
                         }
                         for a in cached_report.attributions
                     ],
+                    "phrase_attributions": [
+                        {
+                            "phrase": p.phrase,
+                            "weight": p.weight,
+                            "direction": p.direction,
+                            "start": p.start,
+                            "end": p.end,
+                            "tokens": p.tokens,
+                        }
+                        for p in cached_report.phrase_attributions
+                    ],
                     "natural_language_summary": cached_report.natural_language_summary,
                 }
                 st.download_button(

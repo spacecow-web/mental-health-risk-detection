@@ -6,6 +6,7 @@ import type {
   TokenPreview,
   ValidationResult,
 } from '@/src/types/mindtrace';
+import { filterAndNormalizeAttributions } from '@/src/utils/explanationFilter';
 
 const URL_REGEX = /https?:\/\/\S+|www\.\S+/gi;
 const MENTION_REGEX = /(?<!\w)@[A-Za-z0-9_]{1,50}/g;
@@ -191,17 +192,24 @@ export function buildGroundedExplanationSummary(
   confidence: number,
   attributions: TokenAttribution[]
 ): string {
-  const ranked = [...attributions].sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight));
-  const supporting = ranked.filter((a) => a.weight > 1e-4).slice(0, 4).map((a) => `'${a.token}'`);
-  const opposing = ranked.filter((a) => a.weight < -1e-4).slice(0, 4).map((a) => `'${a.token}'`);
+  const normalized = filterAndNormalizeAttributions(attributions);
+  const ranked = [...normalized].sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight));
+  const supporting = ranked
+    .filter((a) => a.direction === 'supporting')
+    .slice(0, 4)
+    .map((a) => `'${a.token}'`);
+  const opposing = ranked
+    .filter((a) => a.direction === 'opposing')
+    .slice(0, 4)
+    .map((a) => `'${a.token}'`);
 
-  const supStr = supporting.length > 0 ? supporting.join(', ') : 'none above threshold';
-  const oppStr = opposing.length > 0 ? opposing.join(', ') : 'none above threshold';
+  const supStr = supporting.length > 0 ? supporting.join(', ') : 'none above significance threshold';
+  const oppStr = opposing.length > 0 ? opposing.join(', ') : 'none above significance threshold';
 
   return (
     `Using ${method}, the Transformer model predicted '${targetLabel}' with ${(confidence * 100).toFixed(1)}% ` +
-    `softmax confidence. The words that pushed the model's score most strongly toward '${targetLabel}' were ${supStr}. ` +
-    `The words that pulled the score away from '${targetLabel}' were ${oppStr}. ` +
+    `softmax confidence. The meaningful words that pushed the model's score most strongly toward '${targetLabel}' were ${supStr}. ` +
+    `The meaningful words that pulled the score away from '${targetLabel}' were ${oppStr}. ` +
     `Feature attribution indicates how the Transformer model responded to text features; it does not establish ` +
     `the actual psychological reasons behind a person's writing.`
   );

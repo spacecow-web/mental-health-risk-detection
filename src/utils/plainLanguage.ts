@@ -1,4 +1,12 @@
-import type { InferenceExplanationBundle, TokenAttribution } from '@/src/types/mindtrace';
+import type {
+  InferenceExplanationBundle,
+  PhraseAttribution,
+  TokenAttribution,
+} from '@/src/types/mindtrace';
+import {
+  filterAndNormalizeAttributions,
+  groupMeaningfulPhrases,
+} from '@/src/utils/explanationFilter';
 
 export interface HighlightSegment {
   text: string;
@@ -8,69 +16,70 @@ export interface HighlightSegment {
 
 export function buildGentleHighlightSegments(
   text: string,
-  attributions: TokenAttribution[]
+  attributions: TokenAttribution[],
+  phraseAttributions?: PhraseAttribution[]
 ): HighlightSegment[] {
   if (!text) return [];
 
-  const withOffsets = attributions
-    .filter((a) => typeof a.start === 'number' && typeof a.end === 'number')
-    .sort((a, b) => (a.start ?? 0) - (b.start ?? 0));
+  const filteredWords = filterAndNormalizeAttributions(attributions);
+  const phrases =
+    phraseAttributions && phraseAttributions.length > 0
+      ? phraseAttributions
+      : groupMeaningfulPhrases(text, filteredWords);
 
-  const resolvedSpans: { start: number; end: number; attr: TokenAttribution }[] = [];
+  // Prefer coherent phrase spans when available, falling back to filtered salient word spans
+  const activeSpans: Array<{ start: number; end: number; weight: number }> = [];
 
-  if (withOffsets.length > 0) {
-    for (const attr of withOffsets) {
-      const s = attr.start!;
-      const e = attr.end!;
-      if (s >= 0 && e <= text.length && s < e) {
-        resolvedSpans.push({ start: s, end: e, attr });
+  for (const ph of phrases) {
+    if (ph.direction === 'supporting' && ph.start >= 0 && ph.end <= text.length && ph.start < ph.end) {
+      activeSpans.push({ start: ph.start, end: ph.end, weight: ph.weight });
+    }
+  }
+
+  if (activeSpans.length === 0) {
+    for (const w of filteredWords) {
+      if (
+        w.direction === 'supporting' &&
+        typeof w.start === 'number' &&
+        typeof w.end === 'number' &&
+        w.start >= 0 &&
+        w.end <= text.length &&
+        w.start < w.end
+      ) {
+        activeSpans.push({ start: w.start, end: w.end, weight: w.weight });
       }
     }
-  } else {
-    let cursor = 0;
-    const lowered = text.toLowerCase();
-    for (const attr of attributions) {
-      const cleanTok = attr.token.replace(/^##/, '');
-      if (!cleanTok) continue;
-      let idx = text.indexOf(cleanTok, cursor);
-      if (idx === -1) {
-        idx = lowered.indexOf(cleanTok.toLowerCase(), cursor);
-      }
-      if (idx !== -1) {
-        resolvedSpans.push({ start: idx, end: idx + cleanTok.length, attr });
-        cursor = idx + cleanTok.length;
-      }
-    }
+  }
+
+  activeSpans.sort((a, b) => a.start - b.start);
+
+  // De-overlap spans cleanly
+  const resolvedSpans: Array<{ start: number; end: number; weight: number }> = [];
+  for (const sp of activeSpans) {
+    const prev = resolvedSpans[resolvedSpans.length - 1];
+    if (prev && sp.start < prev.end) continue;
+    resolvedSpans.push(sp);
   }
 
   if (resolvedSpans.length === 0) {
     return [{ text, highlighted: false, alpha: 0 }];
   }
 
-  const maxAbsWeight = Math.max(...attributions.map((a) => Math.abs(a.weight)), 1e-6);
+  const maxAbsWeight = Math.max(...resolvedSpans.map((s) => Math.abs(s.weight)), 1e-6);
   const segments: HighlightSegment[] = [];
   let pos = 0;
 
-  resolvedSpans.forEach((span) => {
-    if (span.start < pos) return;
+  for (const span of resolvedSpans) {
     if (span.start > pos) {
       segments.push({ text: text.slice(pos, span.start), highlighted: false, alpha: 0 });
     }
 
     const slice = text.slice(span.start, span.end);
-    const { weight } = span.attr;
-    const isSup = weight > 1e-4;
-
-    if (!isSup) {
-      segments.push({ text: slice, highlighted: false, alpha: 0 });
-    } else {
-      const norm = Math.min(Math.abs(weight) / maxAbsWeight, 1);
-      const alpha = 0.22 + 0.32 * norm;
-      segments.push({ text: slice, highlighted: true, alpha });
-    }
-
+    const norm = Math.min(Math.abs(span.weight) / maxAbsWeight, 1);
+    const alpha = 0.22 + 0.32 * norm;
+    segments.push({ text: slice, highlighted: true, alpha });
     pos = span.end;
-  });
+  }
 
   if (pos < text.length) {
     segments.push({ text: text.slice(pos), highlighted: false, alpha: 0 });
@@ -89,23 +98,19 @@ export interface PlainLanguageInterpretation {
   whatItMeans: string[];
 }
 
-function cleanDisplayWord(token: string): string {
-  return token.replace(/^##/, '').trim();
-}
-
-function uniqueWords(items: TokenAttribution[], limit: number): string[] {
+function uniqueExpressions(values: string[], limit: number): string[] {
   const seen = new Set<string>();
-  const words: string[] = [];
-  for (const item of items) {
-    const cleaned = cleanDisplayWord(item.token);
-    if (!cleaned || /^[^\w]+$/.test(cleaned)) continue;
+  const out: string[] = [];
+  for (const raw of values) {
+    const cleaned = raw.replace(/^##/, '').trim();
+    if (!cleaned || !/[A-Za-z0-9]/.test(cleaned)) continue;
     const key = cleaned.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
-    words.push(cleaned);
-    if (words.length >= limit) break;
+    out.push(cleaned);
+    if (out.length >= limit) break;
   }
-  return words;
+  return out;
 }
 
 export function createPlainLanguageInterpretation(
@@ -118,15 +123,41 @@ export function createPlainLanguageInterpretation(
     labelLower === 'none' ||
     labelLower === '0';
 
-  const supporting = [...bundle.attributions]
-    .filter((a) => a.weight > 1e-4)
-    .sort((a, b) => b.weight - a.weight);
-  const opposing = [...bundle.attributions]
-    .filter((a) => a.weight < -1e-4)
-    .sort((a, b) => a.weight - b.weight);
+  const sourceText = bundle.cleanedText || bundle.originalText || '';
+  const normalizedWords = filterAndNormalizeAttributions(bundle.attributions);
+  const phrases =
+    bundle.phraseAttributions && bundle.phraseAttributions.length > 0
+      ? bundle.phraseAttributions
+      : groupMeaningfulPhrases(sourceText, normalizedWords);
 
-  const supportingWords = uniqueWords(supporting, 6);
-  const opposingWords = uniqueWords(opposing, 4);
+  const supportingPhrases = [...phrases]
+    .filter((p) => p.direction === 'supporting')
+    .sort((a, b) => b.weight - a.weight)
+    .map((p) => p.phrase);
+
+  const opposingPhrases = [...phrases]
+    .filter((p) => p.direction === 'opposing')
+    .sort((a, b) => a.weight - b.weight)
+    .map((p) => p.phrase);
+
+  const supportingWordFallback = [...normalizedWords]
+    .filter((a) => a.direction === 'supporting')
+    .sort((a, b) => b.weight - a.weight)
+    .map((a) => a.token);
+
+  const opposingWordFallback = [...normalizedWords]
+    .filter((a) => a.direction === 'opposing')
+    .sort((a, b) => a.weight - b.weight)
+    .map((a) => a.token);
+
+  const supportingWords = uniqueExpressions(
+    supportingPhrases.length > 0 ? supportingPhrases : supportingWordFallback,
+    6
+  );
+  const opposingWords = uniqueExpressions(
+    opposingPhrases.length > 0 ? opposingPhrases : opposingWordFallback,
+    4
+  );
 
   let headline = 'Your text appears mostly calm and everyday in tone';
   let noticedSummary =
@@ -158,26 +189,32 @@ export function createPlainLanguageInterpretation(
   const whyItAppeared: string[] = [];
 
   if (supportingWords.length > 0) {
-    const quoted = supportingWords.slice(0, 4).map((w) => `"${w}"`).join(', ');
+    const quoted = supportingWords
+      .slice(0, 4)
+      .map((w) => `"${w}"`)
+      .join(', ');
     if (isNeutralLike) {
       whyItAppeared.push(
-        `Words and phrases such as ${quoted} stood out to the model as calm or everyday expressions.`
+        `Expressions such as ${quoted} stood out to the model as calm or everyday wording.`
       );
     } else {
       whyItAppeared.push(
-        `Words and phrases such as ${quoted} stood out most strongly as expressions commonly linked with emotional weight or strain.`
+        `Expressions such as ${quoted} stood out most strongly as wording commonly linked with emotional weight or strain.`
       );
     }
   } else {
     whyItAppeared.push(
-      'No single word stood out on its own—instead, the overall phrasing across the message shaped the result.'
+      'No single phrase stood out strongly on its own—instead, the overall phrasing across the message shaped the result.'
     );
   }
 
   if (opposingWords.length > 0) {
-    const oppQuoted = opposingWords.slice(0, 3).map((w) => `"${w}"`).join(', ');
+    const oppQuoted = opposingWords
+      .slice(0, 3)
+      .map((w) => `"${w}"`)
+      .join(', ');
     whyItAppeared.push(
-      `At the same time, words like ${oppQuoted} gently balanced the reading in the opposite direction.`
+      `At the same time, expressions like ${oppQuoted} gently balanced the reading in the opposite direction.`
     );
   }
 
@@ -187,7 +224,7 @@ export function createPlainLanguageInterpretation(
     );
   } else {
     whyItAppeared.push(
-      'The AI looks at how words work together in context—not just one word by itself—before deciding which pattern fits best.'
+      'The AI looks at how words work together in context—including negations and full phrases—rather than isolated filler words.'
     );
   }
 

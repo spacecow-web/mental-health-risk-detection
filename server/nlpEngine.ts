@@ -8,6 +8,13 @@ import {
   type PreTrainedTokenizer,
   type PreTrainedModel,
 } from '@huggingface/transformers';
+import {
+  classifyAttributionDirection,
+  computeAdaptiveAttributionThreshold,
+  groupMeaningfulPhrases,
+  isStandaloneStopwordOrPunctuation,
+  type PhraseAttribution as SharedPhraseAttribution,
+} from '../src/utils/explanationFilter.ts';
 
 export type TransformerModelId =
   | 'zero-shot-deberta'
@@ -460,7 +467,8 @@ interface WordSpan {
 
 function extractWordSpans(text: string): WordSpan[] {
   const spans: WordSpan[] = [];
-  const regex = /\[URL\]|\[USER\]|[A-Za-z0-9_']+/g;
+  // Keep contractions like don't / can't / won't / I'm as single whole words; skip standalone punctuation
+  const regex = /\[URL\]|\[USER\]|[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)*/g;
   let match: RegExpExecArray | null;
   while ((match = regex.exec(text)) !== null) {
     spans.push({
@@ -470,12 +478,6 @@ function extractWordSpans(text: string): WordSpan[] {
     });
   }
   return spans;
-}
-
-function classifyDirection(weight: number, eps = 1e-4): 'supporting' | 'opposing' | 'neutral' {
-  if (weight > eps) return 'supporting';
-  if (weight < -eps) return 'opposing';
-  return 'neutral';
 }
 
 function solveLinearSystem(matrix: number[][], rhs: number[]): number[] {
@@ -517,133 +519,223 @@ export async function computeModelAttributions(
   baseProbs: number[],
   method: ExplanationMethod,
   predictProbaFn: (texts: string[]) => Promise<number[][]>,
-  maxAnalyzedSpans = 28
-): Promise<TokenAttribution[]> {
-  const spans = extractWordSpans(cleanedText);
-  if (spans.length === 0) return [];
+  maxAnalyzedSpans = 20
+): Promise<{
+  attributions: TokenAttribution[];
+  phraseAttributions: SharedPhraseAttribution[];
+}> {
+  const allSpans = extractWordSpans(cleanedText);
+  if (allSpans.length === 0) {
+    return { attributions: [], phraseAttributions: [] };
+  }
 
   const targetIdx = Math.max(0, labels.indexOf(targetLabel));
   const baseTargetProb = baseProbs[targetIdx] ?? 0;
 
-  const activeSpans = spans.slice(0, maxAnalyzedSpans);
-  const k = activeSpans.length;
+  // Perturb meaningful content words, negations, and contractions while keeping
+  // grammatical function words intact as syntactic scaffolding (preventing noisy
+  // ungrammatical deltas on isolated "and", "the", "to", "is", "a").
+  const contentIndices = allSpans
+    .map((sp, idx) => ({ sp, idx }))
+    .filter(({ sp }) => !isStandaloneStopwordOrPunctuation(sp.word))
+    .map(({ idx }) => idx);
 
-  const buildMaskedVariant = (keepFlags: boolean[]): string => {
+  const selectedIndices = (
+    contentIndices.length > 0 ? contentIndices : allSpans.map((_, idx) => idx)
+  ).slice(0, maxAnalyzedSpans);
+  const k = selectedIndices.length;
+
+  // Clean omission preserves natural sentence grammar without injecting artificial [MASK] tokens
+  // that zero-shot NLI and sentence encoders were not trained to interpret.
+  const buildOmittedVariant = (keepFlags: boolean[]): string => {
+    const omittedAllIndices = new Set<number>();
+    selectedIndices.forEach((spanIdx, candidatePos) => {
+      if (!keepFlags[candidatePos]) {
+        omittedAllIndices.add(spanIdx);
+      }
+    });
+
     let out = '';
     let cursor = 0;
-    for (let i = 0; i < spans.length; i += 1) {
-      const sp = spans[i];
+    for (let i = 0; i < allSpans.length; i += 1) {
+      const sp = allSpans[i];
       if (sp.start > cursor) {
         out += cleanedText.slice(cursor, sp.start);
       }
-      const keep = i < k ? keepFlags[i] : true;
-      out += keep ? sp.word : '[MASK]';
+      if (!omittedAllIndices.has(i)) {
+        out += sp.word;
+      }
       cursor = sp.end;
     }
     if (cursor < cleanedText.length) {
       out += cleanedText.slice(cursor);
     }
-    return out;
+
+    const collapsed = out
+      .replace(/\s+/g, ' ')
+      .replace(/\s+([.,!?;:])/g, '$1')
+      .trim();
+    return collapsed || 'neutral';
   };
 
+  const rawWeights = new Array<number>(k).fill(0);
+
   if (method === 'SHAP') {
-    const variants: string[] = [];
-    for (let i = 0; i < k; i += 1) {
-      const flags = Array.from({ length: k }, (_, j) => j !== i);
-      variants.push(buildMaskedVariant(flags));
+    // Antithetic Permutation Shapley estimator: averages exact marginal contributions
+    // f(S U {i}) - f(S) across forward, reverse, and interleaved orderings.
+    const fwd = Array.from({ length: k }, (_, i) => i);
+    const rev = [...fwd].reverse();
+    const permutations: number[][] = [fwd, rev];
+
+    if (k >= 4 && k <= 10) {
+      const oddEven = [...fwd.filter((i) => i % 2 === 0), ...fwd.filter((i) => i % 2 === 1)];
+      const oddEvenRev = [...oddEven].reverse();
+      permutations.push(oddEven, oddEvenRev);
     }
-    const probRows = await predictProbaFn(variants);
-    return activeSpans.map((sp, i) => {
-      const occludedProb = probRows[i]?.[targetIdx] ?? baseTargetProb;
-      const weight = baseTargetProb - occludedProb;
-      return {
-        token: sp.word,
-        weight,
-        direction: classifyDirection(weight),
-        start: sp.start,
-        end: sp.end,
-      };
-    });
-  }
 
-  const numSamples = Math.min(28, Math.max(12, k + 4));
-  const rng = { s: 42 };
-  const masks: boolean[][] = [];
-  const sampleTexts: string[] = [];
+    const subsetVariants = new Map<string, string>();
+    const fullKey = fwd.join(',');
+    const subsetProbs = new Map<string, number>([[fullKey, baseTargetProb]]);
 
-  for (let s = 0; s < numSamples; s += 1) {
-    const flags = Array.from({ length: k }, () => seededRand(rng) > 0.32);
-    if (k > 1 && flags.every(Boolean)) {
-      flags[s % k] = false;
-    }
-    if (flags.every((f) => !f)) {
-      flags[s % k] = true;
-    }
-    masks.push(flags);
-    sampleTexts.push(buildMaskedVariant(flags));
-  }
-
-  const sampleProbs = await predictProbaFn(sampleTexts);
-  const dim = k + 1;
-  const xtx = Array.from({ length: dim }, () => Array(dim).fill(0));
-  const xty = Array(dim).fill(0);
-  const sigma = Math.max(1, k * 0.45);
-
-  for (let s = 0; s < numSamples; s += 1) {
-    const maskedCount = masks[s].filter((f) => !f).length;
-    const kernelWeight = Math.exp(-(maskedCount * maskedCount) / (sigma * sigma));
-    const y = sampleProbs[s]?.[targetIdx] ?? baseTargetProb;
-    const x = [1, ...masks[s].map((f) => (f ? 1 : 0))];
-
-    for (let i = 0; i < dim; i += 1) {
-      xty[i] += kernelWeight * x[i] * y;
-      for (let j = 0; j < dim; j += 1) {
-        xtx[i][j] += kernelWeight * x[i] * x[j];
+    for (const perm of permutations) {
+      const active = new Set<number>();
+      const emptyKey = '';
+      if (!subsetProbs.has(emptyKey) && !subsetVariants.has(emptyKey)) {
+        subsetVariants.set(emptyKey, buildOmittedVariant(Array(k).fill(false)));
+      }
+      for (const idx of perm) {
+        active.add(idx);
+        const key = Array.from(active).sort((a, b) => a - b).join(',');
+        if (!subsetProbs.has(key) && !subsetVariants.has(key)) {
+          const flags = Array.from({ length: k }, (_, pos) => active.has(pos));
+          subsetVariants.set(key, buildOmittedVariant(flags));
+        }
       }
     }
-  }
-  for (let i = 1; i < dim; i += 1) {
-    xtx[i][i] += 0.25;
-  }
-  xtx[0][0] += 1e-6;
 
-  const coeffs = solveLinearSystem(xtx, xty);
-  return activeSpans.map((sp, i) => {
-    const weight = coeffs[i + 1] ?? 0;
+    const pendingEntries = Array.from(subsetVariants.entries());
+    if (pendingEntries.length > 0) {
+      const probRows = await predictProbaFn(pendingEntries.map(([, txt]) => txt));
+      pendingEntries.forEach(([key], idx) => {
+        subsetProbs.set(key, probRows[idx]?.[targetIdx] ?? baseTargetProb);
+      });
+    }
+
+    for (const perm of permutations) {
+      const active = new Set<number>();
+      let prevScore = subsetProbs.get('') ?? baseTargetProb;
+      for (const idx of perm) {
+        active.add(idx);
+        const key = Array.from(active).sort((a, b) => a - b).join(',');
+        const nextScore = subsetProbs.get(key) ?? prevScore;
+        rawWeights[idx] += (nextScore - prevScore) / permutations.length;
+        prevScore = nextScore;
+      }
+    }
+  } else {
+    // LIME local weighted linear surrogate over meaningful content/negation spans
+    const numSamples = Math.min(36, Math.max(16, k * 2 + 6));
+    const rng = { s: 42 };
+    const masks: boolean[][] = [];
+    const sampleTexts: string[] = [];
+
+    for (let s = 0; s < numSamples; s += 1) {
+      const flags = Array.from({ length: k }, () => seededRand(rng) > 0.35);
+      if (k > 1 && flags.every(Boolean)) {
+        flags[s % k] = false;
+      }
+      if (flags.every((f) => !f)) {
+        flags[s % k] = true;
+      }
+      masks.push(flags);
+      sampleTexts.push(buildOmittedVariant(flags));
+    }
+
+    const sampleProbs = await predictProbaFn(sampleTexts);
+    const dim = k + 1;
+    const xtx = Array.from({ length: dim }, () => Array(dim).fill(0));
+    const xty = Array(dim).fill(0);
+    const sigma = Math.max(1, k * 0.45);
+
+    for (let s = 0; s < numSamples; s += 1) {
+      const maskedCount = masks[s].filter((f) => !f).length;
+      const kernelWeight = Math.exp(-(maskedCount * maskedCount) / (sigma * sigma));
+      const y = sampleProbs[s]?.[targetIdx] ?? baseTargetProb;
+      const x = [1, ...masks[s].map((f) => (f ? 1 : 0))];
+
+      for (let i = 0; i < dim; i += 1) {
+        xty[i] += kernelWeight * x[i] * y;
+        for (let j = 0; j < dim; j += 1) {
+          xtx[i][j] += kernelWeight * x[i] * x[j];
+        }
+      }
+    }
+    for (let i = 1; i < dim; i += 1) {
+      xtx[i][i] += 0.35;
+    }
+    xtx[0][0] += 1e-6;
+
+    const coeffs = solveLinearSystem(xtx, xty);
+    for (let i = 0; i < k; i += 1) {
+      rawWeights[i] = coeffs[i + 1] ?? 0;
+    }
+  }
+
+  const threshold = computeAdaptiveAttributionThreshold(rawWeights);
+  const attributions: TokenAttribution[] = selectedIndices.map((spanIdx, i) => {
+    const sp = allSpans[spanIdx];
+    const weight = rawWeights[i];
     return {
       token: sp.word,
       weight,
-      direction: classifyDirection(weight),
+      direction: classifyAttributionDirection(weight, threshold),
       start: sp.start,
       end: sp.end,
     };
   });
+
+  const phraseAttributions = groupMeaningfulPhrases(cleanedText, attributions);
+
+  return { attributions, phraseAttributions };
 }
 
 function buildGroundedSummary(
   method: ExplanationMethod,
   targetLabel: string,
   confidence: number,
-  attributions: TokenAttribution[]
+  attributions: TokenAttribution[],
+  phraseAttributions: SharedPhraseAttribution[]
 ): string {
-  const ranked = [...attributions].sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight));
-  const sup = ranked
-    .filter((a) => a.weight > 1e-4)
+  const phraseSup = phraseAttributions
+    .filter((p) => p.direction === 'supporting')
+    .slice(0, 3)
+    .map((p) => `'${p.phrase}'`);
+  const phraseOpp = phraseAttributions
+    .filter((p) => p.direction === 'opposing')
+    .slice(0, 3)
+    .map((p) => `'${p.phrase}'`);
+
+  const rankedWords = [...attributions].sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight));
+  const wordSup = rankedWords
+    .filter((a) => a.direction === 'supporting')
     .slice(0, 4)
     .map((a) => `'${a.token}'`);
-  const opp = ranked
-    .filter((a) => a.weight < -1e-4)
+  const wordOpp = rankedWords
+    .filter((a) => a.direction === 'opposing')
     .slice(0, 4)
     .map((a) => `'${a.token}'`);
+
+  const sup = phraseSup.length > 0 ? phraseSup : wordSup;
+  const opp = phraseOpp.length > 0 ? phraseOpp : wordOpp;
 
   return (
     `Using ${method}, the Transformer model predicted '${targetLabel}' with ${(
       confidence * 100
-    ).toFixed(1)}% softmax confidence. The words that pushed the model's score most strongly toward '${targetLabel}' were ${
-      sup.length ? sup.join(', ') : 'none above threshold'
-    }. The words that pulled the score away from '${targetLabel}' were ${
-      opp.length ? opp.join(', ') : 'none above threshold'
-    }. Feature attribution indicates how the Transformer model responded to text features; it does not establish the actual psychological reasons behind a person's writing.`
+    ).toFixed(1)}% softmax confidence. The words and phrases that pushed the model's score most strongly toward '${targetLabel}' were ${
+      sup.length ? sup.join(', ') : 'none above significance threshold'
+    }. The words and phrases that pulled the score away from '${targetLabel}' were ${
+      opp.length ? opp.join(', ') : 'none above significance threshold'
+    }. Feature attribution indicates how the Transformer model responded to meaningful expressions in the text; it does not establish the actual psychological reasons behind a person's writing.`
   );
 }
 
@@ -747,17 +839,23 @@ export async function analyzeWithActiveTransformer(params: {
     probMap[lbl] = probsVec[idx];
   });
 
-  const attributions = await computeModelAttributions(
+  const { attributions, phraseAttributions } = await computeModelAttributions(
     prep.cleanedText,
     predictedLabel,
     labels,
     probsVec,
     method,
     predictProbaFn,
-    checkpoint ? 64 : 28
+    checkpoint ? 32 : 16
   );
 
-  const summary = buildGroundedSummary(method, predictedLabel, confidence, attributions);
+  const summary = buildGroundedSummary(
+    method,
+    predictedLabel,
+    confidence,
+    attributions,
+    phraseAttributions
+  );
 
   return {
     original_text: params.text,
@@ -774,6 +872,7 @@ export async function analyzeWithActiveTransformer(params: {
     confidence_disclaimer: CONFIDENCE_DISCLAIMER,
     method,
     attributions,
+    phrase_attributions: phraseAttributions,
     natural_language_summary: summary,
     immediate_safety: detectImmediateSelfHarm(params.text),
     supportive_guidance: detectSupportiveGuidance(params.text, predictedLabel),
