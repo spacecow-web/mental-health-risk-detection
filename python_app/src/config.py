@@ -1,4 +1,4 @@
-"""Central configuration dataclasses for MindTrace AI."""
+"""Central configuration dataclasses and default paths for MindTrace AI."""
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -6,9 +6,13 @@ from typing import Dict, List
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DEFAULT_ARTIFACTS_DIR = BASE_DIR / "artifacts" / "model"
+DEFAULT_ARTIFACTS_ROOT = BASE_DIR / "artifacts"
+DEFAULT_ARTIFACTS_DIR = DEFAULT_ARTIFACTS_ROOT / "model"
+DEFAULT_EVAL_SUMMARY_JSON = DEFAULT_ARTIFACTS_ROOT / "evaluation_summary.json"
 DEFAULT_DATA_DIR = BASE_DIR / "data"
+DEFAULT_DATASET_CSV = DEFAULT_DATA_DIR / "default_dataset.csv"
 DEFAULT_EVAL_CSV = DEFAULT_DATA_DIR / "held_out_predictions.csv"
+DEFAULT_HISTORY_CSV = DEFAULT_DATA_DIR / "training_history.csv"
 
 
 SUPPORTED_BACKBONES: Dict[str, str] = {

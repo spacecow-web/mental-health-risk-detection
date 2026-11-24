@@ -21,15 +21,18 @@ from transformers import (
     set_seed,
 )
 
-from src.config import PreprocessingConfig
+from src.config import DEFAULT_EVAL_SUMMARY_JSON, PreprocessingConfig
 from src.data_loader import (
     DatasetNotSuppliedError,
+    REQUIRED_DATASET_GUIDE,
     clean_and_deduplicate_dataset,
     compute_balanced_class_weights,
     inspect_dataset,
     load_labeled_dataset,
+    resolve_default_dataset_path,
     stratified_train_val_test_split,
 )
+from src.evaluation import evaluate_held_out_predictions, save_evaluation_summary
 
 
 def set_reproducibility_seed(seed: int) -> None:
@@ -72,8 +75,9 @@ class WeightedLossTrainer(Trainer):
         return_outputs: bool = False,
         **kwargs: Any,
     ):
-        labels = inputs.pop("labels")
-        outputs = model(**inputs)
+        labels = inputs["labels"]
+        model_inputs = {k: v for k, v in inputs.items() if k != "labels"}
+        outputs = model(**model_inputs)
         logits = outputs.get("logits")
         loss_fct = torch.nn.CrossEntropyLoss(weight=self.class_weights.to(logits.device))
         loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
@@ -146,6 +150,10 @@ def run_training_pipeline(
     cleaned_df, removed_invalid, removed_dups = clean_and_deduplicate_dataset(
         raw_df, text_col=text_col, label_col=label_col, prep_config=prep_cfg
     )
+    if cleaned_df.empty:
+        raise ValueError(
+            "Zero valid rows remain after cleaning and minimum-length filtering."
+        )
     print(
         f"Cleaned corpus: {len(cleaned_df)} unique valid rows "
         f"(removed {removed_invalid} invalid/short, {removed_dups} duplicates)."
@@ -222,8 +230,8 @@ def run_training_pipeline(
 
     trainer.train()
 
-    # 9. Save fine-tuned model, tokenizer, label mapping, and training history
-    model.save_pretrained(out_path)
+    # 9. Save best fine-tuned model, tokenizer, label mapping, and training history
+    trainer.save_model(str(out_path))
     tokenizer.save_pretrained(out_path)
     (out_path / "label_mapping.json").write_text(
         json.dumps(splits.id2label, indent=2), encoding="utf-8"
@@ -256,6 +264,14 @@ def run_training_pipeline(
     eval_path.parent.mkdir(parents=True, exist_ok=True)
     eval_df.to_csv(eval_path, index=False)
 
+    eval_summary = evaluate_held_out_predictions(eval_df)
+    save_evaluation_summary(
+        eval_summary,
+        model_name=model_name,
+        source_file=str(eval_path),
+        output_path=DEFAULT_EVAL_SUMMARY_JSON,
+    )
+
     metadata = {
         "training_completed": True,
         "completed_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -285,7 +301,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fine-tune DistilBERT or BERT on labeled social media mental health text."
     )
-    parser.add_argument("--data_path", type=str, required=True, help="Path to labeled CSV dataset.")
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default=None,
+        help="Path to labeled CSV dataset (defaults to data/default_dataset.csv).",
+    )
     parser.add_argument("--text_col", type=str, default="text")
     parser.add_argument("--label_col", type=str, default="label")
     parser.add_argument(
@@ -305,9 +326,14 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    resolved_data = Path(args.data_path) if args.data_path else resolve_default_dataset_path()
+    if resolved_data is None:
+        print(REQUIRED_DATASET_GUIDE)
+        raise SystemExit(1)
+
     try:
         run_training_pipeline(
-            data_path=args.data_path,
+            data_path=str(resolved_data),
             text_col=args.text_col,
             label_col=args.label_col,
             model_name=args.model_name,

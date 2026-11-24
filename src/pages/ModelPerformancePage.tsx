@@ -1,21 +1,32 @@
-import { useState, type ChangeEvent } from 'react';
-import { Trash2, Upload } from 'lucide-react';
+import { useMemo, useState, type ChangeEvent } from 'react';
+import { ChevronDown, Cpu, Play, Trash2, Upload } from 'lucide-react';
+import type { Data, Layout } from 'plotly.js';
 import { PageHeader } from '@/src/components/PageHeader';
-import type { NamedEvaluationRun, TrainingHistorySummary } from '@/src/types/mindtrace';
+import { PlotlyChart } from '@/src/components/PlotlyChart';
+import type {
+  EndpointConfig,
+  LoadedCorpusData,
+  NamedEvaluationRun,
+  TrainingHistorySummary,
+} from '@/src/types/mindtrace';
 import { parseCsvContent, type ParsedCsv } from '@/src/utils/csvParser';
 import { computeEvaluationMetrics, parseTrainingHistoryCsv } from '@/src/utils/evaluationEngine';
 
 interface ModelPerformancePageProps {
   evaluationRuns: NamedEvaluationRun[];
   activeRunId: string | null;
-  onAddOrUpdateRun: (run: NamedEvaluationRun) => void;
+  onAddOrUpdateRun: (run: NamedEvaluationRun, history?: TrainingHistorySummary) => void;
   onSelectRun: (runId: string) => void;
   onRemoveRun: (runId: string) => void;
   trainingHistory: TrainingHistorySummary | null;
   onSetTrainingHistory: (history: TrainingHistorySummary | null) => void;
+  loadedCorpus: LoadedCorpusData | null;
+  endpointConfig: EndpointConfig;
+  onUpdateEndpointConfig: (config: EndpointConfig) => void;
+  embedded?: boolean;
 }
 
-const SERIES_COLORS = ['#0F2942', '#0D7377', '#2563EB', '#B45309', '#64748B'];
+const SERIES_COLORS = ['#4D6FAF', '#72B9D8', '#7799D8', '#91B9E8', '#83BBA5'];
 
 export function ModelPerformancePage({
   evaluationRuns,
@@ -25,28 +36,125 @@ export function ModelPerformancePage({
   onRemoveRun,
   trainingHistory,
   onSetTrainingHistory,
+  loadedCorpus,
+  endpointConfig,
+  onUpdateEndpointConfig,
+  embedded = false,
 }: ModelPerformancePageProps) {
-  const [runLabelInput, setRunLabelInput] = useState('DistilBERT');
+  const [presetLabel, setPresetLabel] = useState<'DistilBERT' | 'BERT-base' | 'custom'>('DistilBERT');
+  const [customLabel, setCustomLabel] = useState('');
   const [lastParsedCsv, setLastParsedCsv] = useState<{ fileName: string; data: ParsedCsv } | null>(null);
   const [trueCol, setTrueCol] = useState('true_label');
   const [predCol, setPredCol] = useState('predicted_label');
   const [evalError, setEvalError] = useState<string | null>(null);
   const [historyError, setHistoryError] = useState<string | null>(null);
-  const [selectedCell, setSelectedCell] = useState<{
-    trueLabel: string;
-    predLabel: string;
-    count: number;
-  } | null>(null);
+  const [evaluatingActive, setEvaluatingActive] = useState(false);
+  const [trainingBackbone, setTrainingBackbone] = useState<
+    'distilbert-encoder' | 'bert-base-encoder' | null
+  >(null);
+  const [trainStatusNote, setTrainStatusNote] = useState<string | null>(null);
+
+  const effectiveRunLabel =
+    presetLabel === 'custom' ? customLabel.trim() || 'Custom Transformer' : presetLabel;
 
   const activeRun =
     evaluationRuns.find((r) => r.id === activeRunId) ?? evaluationRuns[0] ?? null;
   const evalSummary = activeRun?.summary ?? null;
 
+  async function handleRunActiveEvaluation() {
+    setEvaluatingActive(true);
+    setEvalError(null);
+    setTrainStatusNote(null);
+    try {
+      const resp = await fetch('/api/evaluate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          modelId: endpointConfig.activeServerModelId,
+          rows: loadedCorpus?.rows,
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        throw new Error(data.detail || `Evaluation failed with HTTP ${resp.status}`);
+      }
+      if (data.run) {
+        onAddOrUpdateRun(data.run);
+        setTrainStatusNote(
+          `Evaluated ${data.run.modelName} on N=${data.run.summary.sampleCount} held-out benchmark posts and persisted results.`
+        );
+      }
+    } catch (err) {
+      setEvalError(
+        err instanceof Error ? err.message : 'Unable to evaluate the active model on the default corpus.'
+      );
+    } finally {
+      setEvaluatingActive(false);
+    }
+  }
+
+  async function handleTrainBackbone(backbone: 'distilbert-encoder' | 'bert-base-encoder') {
+    setTrainingBackbone(backbone);
+    setEvalError(null);
+    setTrainStatusNote(null);
+
+    try {
+      const resp = await fetch('/api/train', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          rows: loadedCorpus?.rows,
+          backbone,
+          datasetName: loadedCorpus?.datasetName,
+          epochs: 12,
+          maxSamples: 240,
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        throw new Error(data.detail || `Training failed with HTTP ${resp.status}`);
+      }
+
+      onAddOrUpdateRun(
+        {
+          id: data.runId,
+          modelName: data.modelName,
+          summary: data.summary,
+        },
+        data.trainingHistory
+      );
+
+      if (data.status) {
+        onUpdateEndpointConfig({
+          ...endpointConfig,
+          mode: 'built-in',
+          url: '/api',
+          status: 'connected',
+          activeServerModelId: data.status.activeModelId || backbone,
+          availableServerModels: Array.isArray(data.status.availableModels)
+            ? data.status.availableModels
+            : endpointConfig.availableServerModels,
+          detectedLabels: Array.isArray(data.status.labels)
+            ? data.status.labels
+            : endpointConfig.detectedLabels,
+          lastError: null,
+        });
+      }
+
+      setTrainStatusNote(
+        `Trained & persisted ${data.modelName} on ${data.splitCounts.train} train / ${data.splitCounts.val} val / ${data.splitCounts.test} strict held-out test posts (checkpoint now active for Text Analysis).`
+      );
+    } catch (err) {
+      setEvalError(err instanceof Error ? err.message : 'Transformer fine-tuning failed.');
+    } finally {
+      setTrainingBackbone(null);
+    }
+  }
+
   async function handleUploadEvalCsv(e: ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
     setEvalError(null);
-    setSelectedCell(null);
     try {
       const text = await file.text();
       const parsed = parseCsvContent(text);
@@ -65,11 +173,10 @@ export function ModelPerformancePage({
       setPredCol(detectedPred);
 
       const summary = computeEvaluationMetrics(parsed.rows, detectedTrue, detectedPred, file.name);
-      const cleanName = runLabelInput.trim() || file.name.replace(/\.csv$/i, '');
-      const runId = `${cleanName.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Date.now()}`;
-      onAddOrUpdateRun({ id: runId, modelName: cleanName, summary });
+      const runId = `${effectiveRunLabel.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Date.now()}`;
+      onAddOrUpdateRun({ id: runId, modelName: effectiveRunLabel, summary });
     } catch (err) {
-      setEvalError(err instanceof Error ? err.message : 'Unable to evaluate uploaded CSV.');
+      setEvalError(err instanceof Error ? err.message : 'Unable to evaluate custom CSV.');
     } finally {
       e.target.value = '';
     }
@@ -78,7 +185,6 @@ export function ModelPerformancePage({
   function handleRecomputeColumns(nextTrue: string, nextPred: string) {
     setTrueCol(nextTrue);
     setPredCol(nextPred);
-    setSelectedCell(null);
     if (!lastParsedCsv || !activeRun) return;
     try {
       setEvalError(null);
@@ -110,85 +216,274 @@ export function ModelPerformancePage({
     }
   }
 
-  const maxCellCount = evalSummary
-    ? Math.max(...evalSummary.confusionMatrix.flat(), 1)
-    : 1;
+  const cmPlot = useMemo<{ data: Data[]; layout: Partial<Layout> } | null>(() => {
+    if (!evalSummary) return null;
+    const z = evalSummary.confusionMatrix;
+    const textMatrix = z.map((row) => row.map((v) => String(v)));
+    return {
+      data: [
+        {
+          type: 'heatmap',
+          z,
+          x: evalSummary.labels,
+          y: evalSummary.labels,
+          text: textMatrix as unknown as string[],
+          texttemplate: '%{text}',
+          textfont: { color: '#14263D', size: 13 },
+          colorscale: [
+            [0, '#EAF0FF'],
+            [0.5, '#AFC5F5'],
+            [1, '#7799D8'],
+          ],
+          hovertemplate: 'True: %{y}<br>Predicted: %{x}<br>Count: %{z}<extra></extra>',
+          showscale: true,
+        },
+      ],
+      layout: {
+        height: 360,
+        xaxis: { title: { text: 'Predicted Label' } },
+        yaxis: { title: { text: 'True Label' }, autorange: 'reversed' },
+        margin: { l: 90, r: 24, t: 24, b: 64 },
+      },
+    };
+  }, [evalSummary]);
 
-  // Compute loss chart bounds if training history exists
-  const lossValues = trainingHistory
-    ? trainingHistory.epochs
-        .flatMap((ep) => [ep.trainLoss, ep.evalLoss])
-        .filter((v): v is number => v !== null)
-    : [];
-  const minLoss = lossValues.length > 0 ? Math.min(...lossValues) * 0.9 : 0;
-  const maxLoss = lossValues.length > 0 ? Math.max(...lossValues) * 1.1 : 1;
-  const lossSpan = Math.max(maxLoss - minLoss, 1e-4);
+  const rocPlot = useMemo<{ data: Data[]; layout: Partial<Layout> } | null>(() => {
+    if (!evalSummary || evalSummary.rocCurves.length === 0) return null;
+    const traces: Data[] = evalSummary.rocCurves.map((series, idx) => ({
+      type: 'scatter',
+      mode: 'lines',
+      name: `${series.label} (AUC = ${series.auc.toFixed(3)})`,
+      x: series.points.map((p) => p.fpr),
+      y: series.points.map((p) => p.tpr),
+      line: { color: SERIES_COLORS[idx % SERIES_COLORS.length], width: 2.5 },
+    }));
+    traces.push({
+      type: 'scatter',
+      mode: 'lines',
+      name: 'Random Baseline (0.500)',
+      x: [0, 1],
+      y: [0, 1],
+      line: { color: '#8294AE', width: 1.5, dash: 'dash' },
+    });
+    return {
+      data: traces,
+      layout: {
+        height: 360,
+        xaxis: { title: { text: 'False Positive Rate' }, range: [0, 1.02] },
+        yaxis: { title: { text: 'True Positive Rate' }, range: [0, 1.04] },
+        legend: { orientation: 'h', y: -0.22 },
+        margin: { l: 56, r: 20, t: 24, b: 84 },
+      },
+    };
+  }, [evalSummary]);
+
+  const comparisonPlot = useMemo<{ data: Data[]; layout: Partial<Layout> } | null>(() => {
+    if (evaluationRuns.length < 2) return null;
+    const metricNames = ['Accuracy', 'Macro Precision', 'Macro Recall', 'Macro F1', 'Weighted F1'];
+    const traces: Data[] = evaluationRuns.map((run, idx) => ({
+      type: 'bar',
+      name: `${run.modelName} (N=${run.summary.sampleCount})`,
+      x: metricNames,
+      y: [
+        run.summary.accuracy,
+        run.summary.macroPrecision,
+        run.summary.macroRecall,
+        run.summary.macroF1,
+        run.summary.weightedF1,
+      ],
+      marker: {
+        color: SERIES_COLORS[idx % SERIES_COLORS.length],
+        line: { color: '#EAF0FF', width: 1 },
+      },
+      hovertemplate: '%{x}: %{y:.4f}<extra>%{fullData.name}</extra>',
+    }));
+    return {
+      data: traces,
+      layout: {
+        barmode: 'group',
+        height: 360,
+        yaxis: { title: { text: 'Score (0.0 – 1.0)' }, range: [0, 1.06] },
+        legend: { orientation: 'h', y: -0.2 },
+        margin: { l: 56, r: 24, t: 24, b: 78 },
+      },
+    };
+  }, [evaluationRuns]);
+
+  const sameTestSplitVerified = useMemo(() => {
+    if (evaluationRuns.length < 2) return true;
+    const base = evaluationRuns[0].summary;
+    const baseLabels = base.labels.join('|');
+    return evaluationRuns.every(
+      (r) =>
+        r.summary.sampleCount === base.sampleCount &&
+        r.summary.labels.join('|') === baseLabels
+    );
+  }, [evaluationRuns]);
+
+  const bertRun = evaluationRuns.find(
+    (r) => /\bbert\b/i.test(r.modelName) && !/distilbert/i.test(r.modelName)
+  );
+  const distilRun = evaluationRuns.find((r) => /distilbert/i.test(r.modelName));
+
+  const historyPlot = useMemo<{ data: Data[]; layout: Partial<Layout> } | null>(() => {
+    if (!trainingHistory) return null;
+    const traces: Data[] = [];
+    const trainPts = trainingHistory.epochs.filter((e) => e.trainLoss !== null);
+    const valPts = trainingHistory.epochs.filter((e) => e.evalLoss !== null);
+
+    if (trainPts.length > 0) {
+      traces.push({
+        type: 'scatter',
+        mode: 'lines+markers',
+        name: 'Training Loss',
+        x: trainPts.map((e) => e.epoch),
+        y: trainPts.map((e) => e.trainLoss as number),
+        line: { color: '#4D6FAF', width: 2.5 },
+        marker: { color: '#4D6FAF', size: 6 },
+      });
+    }
+    if (valPts.length > 0) {
+      traces.push({
+        type: 'scatter',
+        mode: 'lines+markers',
+        name: 'Validation Loss',
+        x: valPts.map((e) => e.epoch),
+        y: valPts.map((e) => e.evalLoss as number),
+        line: { color: '#72B9D8', width: 2.5 },
+        marker: { color: '#72B9D8', size: 6 },
+      });
+    }
+    return {
+      data: traces,
+      layout: {
+        height: 300,
+        xaxis: { title: { text: 'Epoch' }, dtick: 1 },
+        yaxis: { title: { text: 'Cross-Entropy Loss' } },
+        legend: { orientation: 'h', y: -0.25 },
+        margin: { l: 56, r: 20, t: 24, b: 72 },
+      },
+    };
+  }, [trainingHistory]);
+
+  const busy = Boolean(trainingBackbone) || evaluatingActive;
 
   return (
-    <div className="space-y-6">
-      <PageHeader
-        title="Model Performance"
-        description="Audit held-out accuracy, precision, recall, F1-score, confusion matrix, multi-model comparisons, and epoch-level training curves from real exported logs."
-      />
+    <div className="space-y-7">
+      {!embedded && (
+        <PageHeader
+          title="Model Performance"
+          description="Inspect persisted Transformer evaluation metrics or evaluate and fine-tune DistilBERT and BERT-base directly on the leak-free 70/15/15 benchmark split."
+        />
+      )}
 
-      {/* Held-Out Evaluation Uploader & Run Manager */}
-      <section className="rounded-xl border border-[#E2E8F0] bg-white p-6 space-y-4">
-        <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4">
+      {/* Built-In Evaluation & Live Transformer Training Controls (No Upload Required) */}
+      <section className="neu-card-elevated p-7 space-y-5">
+        <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
           <div>
-            <h2 className="font-display text-base font-semibold text-[#0F172A]">
-              Held-Out Test Predictions
+            <h2 className="font-display text-base font-semibold text-[#203653]">
+              Transformer Evaluation & Fine-Tuning
             </h2>
-            <p className="mt-1 text-xs text-[#64748B]">
-              Upload one or more held-out CSV files (<code className="font-mono">true_label</code>,{' '}
-              <code className="font-mono">predicted_label</code>, optional{' '}
-              <code className="font-mono">prob_&lt;label&gt;</code>) to compute metrics and compare
-              models.
+            <p className="mt-1 text-xs text-[#526783]">
+              Uses the active research dataset with pre-split deduplication, stratified 70/15/15
+              partitioning, class-weighted training, and automatic persistence of held-out metrics.
             </p>
           </div>
 
-          <div className="flex flex-wrap items-end gap-3">
-            <div>
-              <label htmlFor="run-label-input" className="block text-[11px] font-medium text-[#475569] mb-1">
-                Model Label
-              </label>
-              <input
-                id="run-label-input"
-                type="text"
-                value={runLabelInput}
-                onChange={(e) => setRunLabelInput(e.target.value)}
-                placeholder="e.g. DistilBERT"
-                className="w-40 rounded-lg border border-[#CBD5E1] bg-white px-3 py-2 text-xs text-[#0F172A] min-h-[40px]"
-              />
-            </div>
-            <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg bg-[#0F2942] px-4 py-2 text-xs font-medium text-white hover:bg-[#173A5E] transition-colors whitespace-nowrap shrink-0 min-h-[40px]">
-              <Upload className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>Upload Evaluation CSV</span>
-              <input type="file" accept=".csv,text/csv" onChange={handleUploadEvalCsv} className="sr-only" />
-            </label>
+          <div className="flex flex-wrap items-center gap-3 shrink-0">
+            <button
+              type="button"
+              onClick={handleRunActiveEvaluation}
+              disabled={busy}
+              className="neu-btn-primary inline-flex items-center gap-2 px-4 py-2.5 text-xs disabled:opacity-50 whitespace-nowrap min-h-[40px]"
+            >
+              <Play className="h-3.5 w-3.5 text-white" aria-hidden="true" />
+              <span>{evaluatingActive ? 'Evaluating Model...' : 'Run Model Evaluation'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => handleTrainBackbone('distilbert-encoder')}
+              disabled={busy}
+              className="neu-btn-primary inline-flex items-center gap-2 px-4 py-2.5 text-xs disabled:opacity-50 whitespace-nowrap min-h-[40px]"
+            >
+              <Cpu className="h-3.5 w-3.5 text-white" aria-hidden="true" />
+              <span>
+                {trainingBackbone === 'distilbert-encoder'
+                  ? 'Training DistilBERT...'
+                  : 'Train & Evaluate DistilBERT (6-Layer)'}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => handleTrainBackbone('bert-base-encoder')}
+              disabled={busy}
+              className="neu-btn inline-flex items-center gap-2 px-4 py-2.5 text-xs font-semibold disabled:opacity-50 whitespace-nowrap min-h-[40px]"
+            >
+              <Cpu className="h-3.5 w-3.5 text-[#4D6FAF]" aria-hidden="true" />
+              <span>
+                {trainingBackbone === 'bert-base-encoder'
+                  ? 'Training BERT-Base...'
+                  : 'Train & Evaluate BERT-Base (12-Layer)'}
+              </span>
+            </button>
           </div>
         </div>
 
+        <div className="neu-inset px-4 py-3 text-xs text-[#526783] flex flex-wrap items-center justify-between gap-2">
+          <span>
+            Corpus:{' '}
+            <strong className="text-[#203653]">
+              {loadedCorpus?.datasetName || 'Default Backend Research Dataset'}
+            </strong>
+          </span>
+          <span className="font-mono tabular-nums text-[#203653]">
+            {loadedCorpus
+              ? `${loadedCorpus.rows.length} labeled records ready`
+              : 'Managed automatically on backend'}
+          </span>
+        </div>
+
+        {evaluatingActive && (
+          <div className="neu-inset px-4 py-3 text-xs text-[#203653]">
+            Evaluating active Transformer model against the held-out test split and persisting metrics...
+          </div>
+        )}
+
+        {trainingBackbone && (
+          <div className="neu-inset px-4 py-3 text-xs text-[#203653]">
+            Encoding corpus with{' '}
+            {trainingBackbone === 'distilbert-encoder' ? 'DistilBERT (6-layer)' : 'BERT-base (12-layer)'}{' '}
+            & running class-weighted training on stratified 70/15/15 split...
+          </div>
+        )}
+
+        {trainStatusNote && (
+          <div
+            className="neu-inset px-4 py-3 text-xs text-[#1E4D3B] font-medium"
+            style={{ background: '#E7F3EE' }}
+          >
+            {trainStatusNote}
+          </div>
+        )}
+
         {evaluationRuns.length > 0 && (
-          <div className="pt-3 border-t border-[#E2E8F0] flex flex-wrap items-center gap-2">
-            <span className="text-xs font-medium text-[#64748B] mr-1">Loaded Runs:</span>
+          <div className="pt-3 border-t border-[#AFC5F5]/55 flex flex-wrap items-center gap-2.5">
+            <span className="text-xs font-medium text-[#526783] mr-1">Saved Evaluations:</span>
             {evaluationRuns.map((run) => {
               const isSelected = activeRun?.id === run.id;
               return (
                 <div
                   key={run.id}
-                  className={`inline-flex items-center rounded-lg border text-xs ${
-                    isSelected
-                      ? 'border-[#0F2942] bg-[#0F2942] text-white'
-                      : 'border-[#E2E8F0] bg-[#F8FAFC] text-[#0F172A]'
+                  className={`inline-flex items-center text-xs transition-all ${
+                    isSelected ? 'neu-btn-accent' : 'neu-btn'
                   }`}
                 >
                   <button
                     type="button"
-                    onClick={() => {
-                      onSelectRun(run.id);
-                      setSelectedCell(null);
-                    }}
-                    className="px-3 py-1.5 font-medium whitespace-nowrap"
+                    onClick={() => onSelectRun(run.id)}
+                    className="px-3.5 py-1.5 font-medium whitespace-nowrap text-[#203653]"
                   >
                     {run.modelName} (N={run.summary.sampleCount})
                   </button>
@@ -196,8 +491,8 @@ export function ModelPerformancePage({
                     type="button"
                     onClick={() => onRemoveRun(run.id)}
                     aria-label={`Remove ${run.modelName}`}
-                    className={`pr-2.5 pl-1 py-1.5 opacity-80 hover:opacity-100 ${
-                      isSelected ? 'text-white' : 'text-[#64748B]'
+                    className={`pr-3 pl-1 py-1.5 opacity-80 hover:opacity-100 ${
+                      isSelected ? 'text-[#203653]' : 'text-[#526783]'
                     }`}
                   >
                     <Trash2 className="h-3.5 w-3.5" />
@@ -208,277 +503,132 @@ export function ModelPerformancePage({
           </div>
         )}
 
-        {lastParsedCsv && activeRun && (
-          <div className="pt-3 border-t border-[#E2E8F0] grid gap-4 sm:grid-cols-3 text-xs">
-            <div>
-              <span className="block text-[#64748B] mb-1">Latest CSV File</span>
-              <span className="font-mono font-medium text-[#0F172A] break-all">
-                {lastParsedCsv.fileName}
-              </span>
-            </div>
-            <div>
-              <label htmlFor="true-col-select" className="block text-[#64748B] mb-1">
-                Ground Truth Column
-              </label>
-              <select
-                id="true-col-select"
-                value={trueCol}
-                onChange={(e) => handleRecomputeColumns(e.target.value, predCol)}
-                className="w-full rounded-lg border border-[#CBD5E1] bg-white px-3 py-1.5 text-xs text-[#0F172A]"
-              >
-                {lastParsedCsv.data.headers.map((h) => (
-                  <option key={h} value={h}>
-                    {h}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label htmlFor="pred-col-select" className="block text-[#64748B] mb-1">
-                Predicted Label Column
-              </label>
-              <select
-                id="pred-col-select"
-                value={predCol}
-                onChange={(e) => handleRecomputeColumns(trueCol, e.target.value)}
-                className="w-full rounded-lg border border-[#CBD5E1] bg-white px-3 py-1.5 text-xs text-[#0F172A]"
-              >
-                {lastParsedCsv.data.headers.map((h) => (
-                  <option key={h} value={h}>
-                    {h}
-                  </option>
-                ))}
-              </select>
-            </div>
-          </div>
-        )}
-
         {evalError && (
-          <div className="rounded-lg bg-[#FEF2F2] p-3 text-xs text-[#991B1B]">{evalError}</div>
+          <div
+            className="neu-inset p-3.5 text-xs text-[#6B2A3A]"
+            style={{ background: '#F6E9ED' }}
+          >
+            {evalError}
+          </div>
         )}
       </section>
 
-      {/* Metrics + Confusion Matrix + ROC-AUC */}
       {!evalSummary ? (
-        <section className="rounded-xl border border-[#E2E8F0] bg-white p-8 max-w-3xl">
-          <div className="text-xs font-mono text-[#0D7377]">
-            Empty State · No Held-Out Evaluation Data Loaded
+        <section className="neu-card p-8 max-w-3xl space-y-3">
+          <div className="text-xs font-mono text-[#4D6FAF]">
+            Empty State · Model Not Yet Evaluated
           </div>
-          <h3 className="mt-2 font-display text-lg font-semibold text-[#0F172A]">
-            Supply Real Held-Out Predictions to Compute Evaluation Metrics
-          </h3>
-          <p className="mt-2 text-sm leading-relaxed text-[#475569]">
-            MindTrace AI never displays synthetic Accuracy, Precision, Recall, F1-score, or
-            Confusion Matrix figures. Run <code className="font-mono text-xs">python -m src.train</code>{' '}
-            to produce <code className="font-mono text-xs">held_out_predictions.csv</code> and upload
-            it above.
+          <h2 className="font-display text-lg font-semibold text-[#203653]">
+            No Saved Evaluation Results Available Yet
+          </h2>
+          <p className="text-sm leading-relaxed text-[#526783]">
+            MindTrace AI never displays synthetic accuracy values or fabricated charts. Click{' '}
+            <strong className="text-[#203653]">Run Model Evaluation</strong> above to evaluate the
+            active model on the default research corpus, or train{' '}
+            <strong className="text-[#203653]">DistilBERT</strong> /{' '}
+            <strong className="text-[#203653]">BERT-Base</strong> to generate and persist genuine
+            held-out metrics automatically.
           </p>
         </section>
       ) : (
         <>
-          <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
-            {[
-              { label: 'Held-Out Samples', value: String(evalSummary.sampleCount) },
-              { label: 'Accuracy', value: `${(evalSummary.accuracy * 100).toFixed(2)}%` },
-              { label: 'Macro Precision', value: evalSummary.macroPrecision.toFixed(4) },
-              { label: 'Macro Recall', value: evalSummary.macroRecall.toFixed(4) },
-              {
-                label: evalSummary.rocAucMacro !== null ? 'Macro F1 / ROC-AUC' : 'Macro F1-Score',
-                value:
-                  evalSummary.rocAucMacro !== null
-                    ? `${evalSummary.macroF1.toFixed(4)} / ${evalSummary.rocAucMacro.toFixed(4)}`
-                    : evalSummary.macroF1.toFixed(4),
-              },
-            ].map((kpi) => (
-              <div key={kpi.label} className="rounded-xl border border-[#E2E8F0] bg-white p-5">
-                <div className="text-xs text-[#64748B]">{kpi.label}</div>
-                <div className="mt-1.5 font-mono text-xl font-semibold tabular-nums text-[#0F2942]">
-                  {kpi.value}
+          {/* 6 Core Metrics Strip */}
+          <section className="neu-card p-7 space-y-4">
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
+              {[
+                { label: 'Accuracy', value: `${(evalSummary.accuracy * 100).toFixed(2)}%` },
+                { label: 'Macro Precision', value: evalSummary.macroPrecision.toFixed(4) },
+                { label: 'Macro Recall', value: evalSummary.macroRecall.toFixed(4) },
+                { label: 'Macro F1-Score', value: evalSummary.macroF1.toFixed(4) },
+                { label: 'Weighted F1-Score', value: evalSummary.weightedF1.toFixed(4) },
+                {
+                  label: 'Macro ROC-AUC',
+                  value:
+                    evalSummary.rocAucMacro !== null ? evalSummary.rocAucMacro.toFixed(4) : 'N/A',
+                },
+              ].map((kpi) => (
+                <div key={kpi.label} className="neu-inset p-4">
+                  <div className="text-xs text-[#526783]">{kpi.label}</div>
+                  <div className="mt-1 font-mono text-lg font-semibold tabular-nums text-[#203653]">
+                    {kpi.value}
+                  </div>
                 </div>
-              </div>
-            ))}
+              ))}
+            </div>
+            <p className="text-xs leading-relaxed text-[#526783]">
+              <strong className="text-[#203653]">Metric Guide:</strong> <em>Accuracy</em> is the
+              overall share of correct predictions (N={evalSummary.sampleCount}). <em>Precision</em>{' '}
+              measures how reliable a positive prediction is, while <em>Recall</em> measures how many
+              true cases were found. <em>Macro F1</em> treats every category equally regardless of
+              size, whereas <em>Weighted F1</em> scales each category&apos;s F1-score by its sample
+              count.
+            </p>
           </section>
 
+          {/* Interactive Plotly Confusion Matrix & ROC-AUC */}
           <div className="grid gap-6 lg:grid-cols-12">
-            <section className="lg:col-span-6 rounded-xl border border-[#E2E8F0] bg-white p-6 space-y-4">
+            <section className="lg:col-span-6 neu-card p-7 space-y-3">
               <div className="flex items-center justify-between">
-                <h3 className="font-display text-base font-semibold text-[#0F172A]">
+                <h3 className="font-display text-base font-semibold text-[#203653]">
                   Confusion Matrix ({activeRun?.modelName})
                 </h3>
-                <span className="text-xs text-[#64748B]">Rows: True · Cols: Predicted</span>
+                <span className="text-xs font-mono tabular-nums text-[#526783]">
+                  N={evalSummary.sampleCount}
+                </span>
               </div>
-
-              <div className="overflow-x-auto">
-                <table className="w-full border-collapse text-xs">
-                  <thead>
-                    <tr>
-                      <th className="p-2 text-left text-[#64748B]">True \ Pred</th>
-                      {evalSummary.labels.map((lbl) => (
-                        <th
-                          key={lbl}
-                          className="p-2 text-center font-medium text-[#0F172A] truncate max-w-[100px]"
-                          title={lbl}
-                        >
-                          {lbl}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {evalSummary.labels.map((trueLbl, rIdx) => (
-                      <tr key={trueLbl}>
-                        <td
-                          className="p-2 font-medium text-[#0F172A] truncate max-w-[110px]"
-                          title={trueLbl}
-                        >
-                          {trueLbl}
-                        </td>
-                        {evalSummary.labels.map((predLbl, cIdx) => {
-                          const count = evalSummary.confusionMatrix[rIdx][cIdx];
-                          const intensity = count / maxCellCount;
-                          const isDiag = rIdx === cIdx;
-                          const bg = isDiag
-                            ? `rgba(15, 41, 66, ${(0.1 + 0.78 * intensity).toFixed(2)})`
-                            : `rgba(180, 83, 9, ${(0.04 + 0.55 * intensity).toFixed(2)})`;
-                          const textLight = isDiag && intensity > 0.55;
-                          return (
-                            <td key={`${trueLbl}-${predLbl}`} className="p-1">
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setSelectedCell({
-                                    trueLabel: trueLbl,
-                                    predLabel: predLbl,
-                                    count,
-                                  })
-                                }
-                                style={{ backgroundColor: bg }}
-                                className={`w-full rounded-md py-3 px-2 font-mono font-semibold tabular-nums transition-opacity hover:opacity-90 ${
-                                  textLight ? 'text-white' : 'text-[#0F172A]'
-                                }`}
-                              >
-                                {count}
-                              </button>
-                            </td>
-                          );
-                        })}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-
-              {selectedCell && (
-                <div className="rounded-lg bg-[#F8FAFC] p-3 text-xs text-[#334155] font-mono tabular-nums">
-                  True: {selectedCell.trueLabel} · Predicted: {selectedCell.predLabel} · Count:{' '}
-                  {selectedCell.count}
-                </div>
-              )}
+              {cmPlot && <PlotlyChart data={cmPlot.data} layout={cmPlot.layout} />}
+              <p className="text-xs leading-relaxed text-[#526783]">
+                <strong className="text-[#203653]">How to read this chart:</strong> Deeper periwinkle
+                cells along the diagonal from top-left to bottom-right represent correct predictions.
+                Off-diagonal numbers show where the model confused one category for another.
+              </p>
             </section>
 
-            <section className="lg:col-span-6 rounded-xl border border-[#E2E8F0] bg-white p-6 space-y-4">
+            <section className="lg:col-span-6 neu-card p-7 space-y-3">
               <div className="flex items-center justify-between">
-                <h3 className="font-display text-base font-semibold text-[#0F172A]">
-                  ROC-AUC Curve (One-vs-Rest)
+                <h3 className="font-display text-base font-semibold text-[#203653]">
+                  ROC Curves & AUC (One-vs-Rest)
                 </h3>
                 {evalSummary.rocAucMacro !== null && (
-                  <span className="font-mono text-xs tabular-nums text-[#0D7377]">
+                  <span className="font-mono text-xs tabular-nums text-[#4D6FAF]">
                     Macro AUC: {evalSummary.rocAucMacro.toFixed(4)}
                   </span>
                 )}
               </div>
 
-              {evalSummary.rocCurves.length === 0 ? (
-                <div className="rounded-lg bg-[#F8FAFC] p-6 text-xs leading-relaxed text-[#475569]">
-                  ROC-AUC curves require class probability columns named{' '}
-                  <code className="font-mono">prob_&lt;label&gt;</code> for every label in the CSV.
+              {!rocPlot ? (
+                <div className="neu-inset p-6 text-xs leading-relaxed text-[#526783]">
+                  ROC-AUC curves require continuous per-class probability scores alongside held-out
+                  predictions.
                 </div>
               ) : (
-                <div className="space-y-3">
-                  <svg
-                    viewBox="0 0 360 240"
-                    role="img"
-                    aria-label="Receiver Operating Characteristic curve"
-                    className="w-full h-auto rounded-lg bg-[#F8FAFC] border border-[#E2E8F0]"
-                  >
-                    <line x1="44" y1="204" x2="336" y2="204" stroke="#CBD5E1" strokeWidth="1" />
-                    <line x1="44" y1="20" x2="44" y2="204" stroke="#CBD5E1" strokeWidth="1" />
-                    <line
-                      x1="44"
-                      y1="204"
-                      x2="336"
-                      y2="20"
-                      stroke="#94A3B8"
-                      strokeWidth="1"
-                      strokeDasharray="4 4"
-                    />
-                    {evalSummary.rocCurves.map((series, idx) => {
-                      const d = series.points
-                        .map((pt, pIdx) => {
-                          const x = 44 + pt.fpr * 292;
-                          const y = 204 - pt.tpr * 184;
-                          return `${pIdx === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
-                        })
-                        .join(' ');
-                      return (
-                        <path
-                          key={series.label}
-                          d={d}
-                          fill="none"
-                          stroke={SERIES_COLORS[idx % SERIES_COLORS.length]}
-                          strokeWidth="2.2"
-                        />
-                      );
-                    })}
-                    <text x="190" y="228" textAnchor="middle" fontSize="10" fill="#64748B">
-                      False Positive Rate
-                    </text>
-                    <text
-                      x="14"
-                      y="112"
-                      textAnchor="middle"
-                      fontSize="10"
-                      fill="#64748B"
-                      transform="rotate(-90 14 112)"
-                    >
-                      True Positive Rate
-                    </text>
-                  </svg>
-
-                  <div className="flex flex-wrap gap-4 text-xs">
-                    {evalSummary.rocCurves.map((series, idx) => (
-                      <div key={series.label} className="inline-flex items-center gap-1.5">
-                        <span
-                          className="inline-block h-2.5 w-2.5 rounded-xs"
-                          style={{ backgroundColor: SERIES_COLORS[idx % SERIES_COLORS.length] }}
-                        />
-                        <span className="text-[#334155]">
-                          {series.label}:{' '}
-                          <span className="font-mono tabular-nums font-semibold">
-                            {series.auc.toFixed(3)}
-                          </span>
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
+                <>
+                  <PlotlyChart data={rocPlot.data} layout={rocPlot.layout} />
+                  <p className="text-xs leading-relaxed text-[#526783]">
+                    <strong className="text-[#203653]">How to read this chart:</strong> Curves
+                    arching closer to the top-left corner (AUC near 1.0) mean the model cleanly
+                    separates that category from all others across confidence thresholds, whereas
+                    the dashed diagonal (0.50) represents random guessing.
+                  </p>
+                </>
               )}
             </section>
           </div>
 
-          <section className="rounded-xl border border-[#E2E8F0] bg-white p-6">
-            <div className="flex items-center justify-between pb-3 border-b border-[#E2E8F0]">
-              <h3 className="font-display text-base font-semibold text-[#0F172A]">
-                Per-Class Classification Report
+          {/* Classification Report */}
+          <section className="neu-card p-7 space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-[#AFC5F5]/55">
+              <h3 className="font-display text-base font-semibold text-[#203653]">
+                Classification Report ({activeRun?.modelName})
               </h3>
-              <span className="text-xs font-mono tabular-nums text-[#64748B]">
-                Weighted F1: {evalSummary.weightedF1.toFixed(4)}
+              <span className="text-xs font-mono tabular-nums text-[#526783]">
+                Source: {evalSummary.fileName}
               </span>
             </div>
-            <div className="overflow-x-auto mt-3">
+            <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse text-sm">
                 <thead>
-                  <tr className="border-b border-[#E2E8F0] text-xs font-semibold text-[#64748B]">
+                  <tr className="border-b border-[#AFC5F5]/55 text-xs font-semibold text-[#526783]">
                     <th className="py-2.5 pr-4">Category</th>
                     <th className="py-2.5 pr-4 text-right">Precision</th>
                     <th className="py-2.5 pr-4 text-right">Recall</th>
@@ -486,24 +636,50 @@ export function ModelPerformancePage({
                     <th className="py-2.5 text-right">Support</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-[#E2E8F0]">
+                <tbody className="divide-y divide-[#AFC5F5]/45">
                   {evalSummary.perClassMetrics.map((row) => (
-                    <tr key={row.label} className="hover:bg-[#F8FAFC]">
-                      <td className="py-2.5 pr-4 font-medium text-[#0F172A]">{row.label}</td>
-                      <td className="py-2.5 pr-4 text-right font-mono tabular-nums text-[#334155]">
+                    <tr key={row.label} className="hover:bg-[#E5ECFF]/70 transition-colors">
+                      <td className="py-2.5 pr-4 font-medium text-[#203653]">{row.label}</td>
+                      <td className="py-2.5 pr-4 text-right font-mono tabular-nums text-[#526783]">
                         {row.precision.toFixed(4)}
                       </td>
-                      <td className="py-2.5 pr-4 text-right font-mono tabular-nums text-[#334155]">
+                      <td className="py-2.5 pr-4 text-right font-mono tabular-nums text-[#526783]">
                         {row.recall.toFixed(4)}
                       </td>
-                      <td className="py-2.5 pr-4 text-right font-mono tabular-nums font-semibold text-[#0F2942]">
+                      <td className="py-2.5 pr-4 text-right font-mono tabular-nums font-semibold text-[#203653]">
                         {row.f1Score.toFixed(4)}
                       </td>
-                      <td className="py-2.5 text-right font-mono tabular-nums text-[#475569]">
+                      <td className="py-2.5 text-right font-mono tabular-nums text-[#526783]">
                         {row.support}
                       </td>
                     </tr>
                   ))}
+                  <tr className="bg-[#D5E1FC]/75 font-medium">
+                    <td className="py-2.5 pr-4 text-[#203653]">Macro Average</td>
+                    <td className="py-2.5 pr-4 text-right font-mono tabular-nums text-[#203653]">
+                      {evalSummary.macroPrecision.toFixed(4)}
+                    </td>
+                    <td className="py-2.5 pr-4 text-right font-mono tabular-nums text-[#203653]">
+                      {evalSummary.macroRecall.toFixed(4)}
+                    </td>
+                    <td className="py-2.5 pr-4 text-right font-mono tabular-nums text-[#4D6FAF]">
+                      {evalSummary.macroF1.toFixed(4)}
+                    </td>
+                    <td className="py-2.5 text-right font-mono tabular-nums text-[#526783]">
+                      {evalSummary.sampleCount}
+                    </td>
+                  </tr>
+                  <tr className="bg-[#D5E1FC]/75 font-medium">
+                    <td className="py-2.5 pr-4 text-[#203653]">Weighted Average</td>
+                    <td className="py-2.5 pr-4 text-right font-mono tabular-nums text-[#8294AE]">—</td>
+                    <td className="py-2.5 pr-4 text-right font-mono tabular-nums text-[#8294AE]">—</td>
+                    <td className="py-2.5 pr-4 text-right font-mono tabular-nums text-[#2F7D9E]">
+                      {evalSummary.weightedF1.toFixed(4)}
+                    </td>
+                    <td className="py-2.5 text-right font-mono tabular-nums text-[#526783]">
+                      {evalSummary.sampleCount}
+                    </td>
+                  </tr>
                 </tbody>
               </table>
             </div>
@@ -511,209 +687,327 @@ export function ModelPerformancePage({
         </>
       )}
 
-      {/* Model Comparison Charts */}
-      <section className="rounded-xl border border-[#E2E8F0] bg-white p-6 space-y-4">
-        <div>
-          <h2 className="font-display text-base font-semibold text-[#0F172A]">
-            Model Comparison Chart
-          </h2>
-          <p className="text-xs text-[#64748B]">
-            Side-by-side comparison of Accuracy, Macro Precision, Macro Recall, and Macro F1 across
-            uploaded evaluation runs.
-          </p>
+      {/* Multi-Model / BERT vs. DistilBERT Comparison */}
+      <section className="neu-card p-7 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="font-display text-base font-semibold text-[#203653]">
+              Transformer Model Comparison (BERT vs. DistilBERT)
+            </h2>
+            <p className="text-xs text-[#526783]">
+              Compare multiple fine-tuned Transformer checkpoints evaluated on the identical held-out
+              test split.
+            </p>
+          </div>
+          {evaluationRuns.length >= 2 && (
+            <span className="font-mono text-xs text-[#4D6FAF]">
+              {sameTestSplitVerified
+                ? `Shared Test Set Verified (N=${evaluationRuns[0].summary.sampleCount})`
+                : 'Different N or Labels Across Runs'}
+            </span>
+          )}
         </div>
 
-        {evaluationRuns.length < 2 ? (
-          <div className="rounded-lg bg-[#F8FAFC] p-5 text-xs leading-relaxed text-[#475569]">
-            <div className="font-semibold text-[#0F172A]">
+        {evaluationRuns.length < 2 || !comparisonPlot ? (
+          <div className="neu-inset p-5 text-xs leading-relaxed text-[#526783]">
+            <div className="font-semibold text-[#203653]">
               {evaluationRuns.length === 0
-                ? 'Empty State — Upload Held-Out CSVs to Compare Models'
-                : 'One Run Loaded — Upload a Second Model CSV (e.g., BERT-base) to Compare'}
+                ? 'Evaluate or Train At Least Two Models to Compare'
+                : 'One Evaluation Saved — Evaluate or Train a Second Architecture'}
             </div>
             <p className="mt-1">
-              Change the Model Label above (for example from <code className="font-mono">DistilBERT</code>{' '}
-              to <code className="font-mono">BERT-base</code>) and upload another held-out
-              predictions CSV to render a real side-by-side comparison chart.
+              Use <strong className="text-[#203653]">Train & Evaluate DistilBERT (6-Layer)</strong>{' '}
+              and <strong className="text-[#203653]">Train & Evaluate BERT-Base (12-Layer)</strong>{' '}
+              above to generate a direct side-by-side Plotly comparison on the same test set.
             </p>
           </div>
         ) : (
           <div className="space-y-4">
-            {(
-              [
-                ['Accuracy', (r: NamedEvaluationRun) => r.summary.accuracy],
-                ['Macro Precision', (r: NamedEvaluationRun) => r.summary.macroPrecision],
-                ['Macro Recall', (r: NamedEvaluationRun) => r.summary.macroRecall],
-                ['Macro F1-Score', (r: NamedEvaluationRun) => r.summary.macroF1],
-              ] as [string, (r: NamedEvaluationRun) => number][]
-            ).map(([metricLabel, getter]) => (
-              <div key={metricLabel} className="space-y-2">
-                <div className="text-xs font-semibold text-[#0F172A]">{metricLabel}</div>
-                <div className="space-y-1.5">
-                  {evaluationRuns.map((run, idx) => {
-                    const val = getter(run);
-                    return (
-                      <div key={`${metricLabel}-${run.id}`} className="grid grid-cols-12 items-center gap-2 text-xs">
-                        <div className="col-span-3 truncate text-[#334155]">{run.modelName}</div>
-                        <div className="col-span-7 h-3.5 rounded bg-[#F1F5F9] overflow-hidden">
-                          <div
-                            className="h-full rounded"
-                            style={{
-                              width: `${Math.max(2, val * 100)}%`,
-                              backgroundColor: SERIES_COLORS[idx % SERIES_COLORS.length],
-                            }}
-                          />
-                        </div>
-                        <div className="col-span-2 text-right font-mono tabular-nums text-[#0F172A]">
-                          {(val * 100).toFixed(2)}%
-                        </div>
+            {!sameTestSplitVerified && (
+              <div
+                className="neu-inset p-3.5 text-xs text-[#5C4419]"
+                style={{ background: '#F7F1E3' }}
+              >
+                Note: The saved evaluation runs have different sample counts or label sets. For a
+                scientifically strict comparison, evaluate both models on the identical held-out test
+                split.
+              </div>
+            )}
+
+            <PlotlyChart data={comparisonPlot.data} layout={comparisonPlot.layout} />
+
+            {bertRun && distilRun && (
+              <div className="neu-inset p-5 space-y-3">
+                <div className="text-xs font-semibold text-[#203653]">
+                  Direct Comparison: {bertRun.modelName} vs. {distilRun.modelName}
+                </div>
+                <div className="grid gap-3 sm:grid-cols-4 text-xs">
+                  {[
+                    {
+                      label: 'Δ Accuracy (BERT − DistilBERT)',
+                      val: (bertRun.summary.accuracy - distilRun.summary.accuracy) * 100,
+                      suffix: ' pp',
+                    },
+                    {
+                      label: 'Δ Macro F1',
+                      val: bertRun.summary.macroF1 - distilRun.summary.macroF1,
+                      suffix: '',
+                    },
+                    {
+                      label: 'Δ Weighted F1',
+                      val: bertRun.summary.weightedF1 - distilRun.summary.weightedF1,
+                      suffix: '',
+                    },
+                    {
+                      label: 'Δ Macro ROC-AUC',
+                      val:
+                        bertRun.summary.rocAucMacro !== null &&
+                        distilRun.summary.rocAucMacro !== null
+                          ? bertRun.summary.rocAucMacro - distilRun.summary.rocAucMacro
+                          : null,
+                      suffix: '',
+                    },
+                  ].map((d) => (
+                    <div key={d.label} className="neu-card p-3.5">
+                      <div className="text-[11px] text-[#526783]">{d.label}</div>
+                      <div className="mt-1 font-mono text-sm font-semibold tabular-nums text-[#203653]">
+                        {d.val === null
+                          ? 'N/A'
+                          : `${d.val >= 0 ? '+' : ''}${d.val.toFixed(d.suffix ? 2 : 4)}${d.suffix}`}
                       </div>
-                    );
-                  })}
+                    </div>
+                  ))}
                 </div>
               </div>
-            ))}
+            )}
+
+            <p className="text-xs leading-relaxed text-[#526783]">
+              <strong className="text-[#203653]">How to read this chart:</strong> Comparing
+              DistilBERT (6 layers, faster inference) against BERT-base (12 layers, higher capacity)
+              on the identical test split reveals whether extra model depth yields meaningful gains
+              in Macro F1 and minority-class recall.
+            </p>
           </div>
         )}
       </section>
 
-      {/* Training and Validation Performance */}
-      <section className="rounded-xl border border-[#E2E8F0] bg-white p-6 space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-          <div>
-            <h2 className="font-display text-base font-semibold text-[#0F172A]">
-              Training & Validation Performance
-            </h2>
-            <p className="text-xs text-[#64748B]">
-              Upload <code className="font-mono">training_history.csv</code> (exported by{' '}
-              <code className="font-mono">src/train.py</code>) containing{' '}
-              <code className="font-mono">epoch</code>, <code className="font-mono">train_loss</code>,{' '}
-              <code className="font-mono">eval_loss</code>, and optional{' '}
-              <code className="font-mono">eval_accuracy</code> / <code className="font-mono">eval_f1</code>.
-            </p>
-          </div>
-          <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-[#CBD5E1] bg-white px-4 py-2 text-xs font-medium text-[#0F172A] hover:bg-[#F1F5F9] whitespace-nowrap shrink-0 min-h-[40px]">
-            <Upload className="h-3.5 w-3.5" aria-hidden="true" />
-            <span>{trainingHistory ? 'Replace History CSV' : 'Upload Training History CSV'}</span>
-            <input
-              type="file"
-              accept=".csv,text/csv"
-              onChange={handleUploadTrainingHistory}
-              className="sr-only"
-            />
-          </label>
+      {/* Training & Validation Curves */}
+      <section className="neu-card p-7 space-y-4">
+        <div>
+          <h2 className="font-display text-base font-semibold text-[#203653]">
+            Training & Validation Curves
+          </h2>
+          <p className="text-xs text-[#526783]">
+            Epoch loss and validation F1 progression saved automatically from Transformer training runs.
+          </p>
         </div>
 
-        {historyError && (
-          <div className="rounded-lg bg-[#FEF2F2] p-3 text-xs text-[#991B1B]">{historyError}</div>
-        )}
-
-        {!trainingHistory ? (
-          <div className="rounded-lg bg-[#F8FAFC] p-5 text-xs leading-relaxed text-[#475569]">
-            <div className="font-semibold text-[#0F172A]">
-              Empty State — Training Logs Not Supplied
+        {!trainingHistory || !historyPlot ? (
+          <div className="neu-inset p-5 text-xs leading-relaxed text-[#526783]">
+            <div className="font-semibold text-[#203653]">
+              No Training Epoch Logs Recorded Yet
             </div>
             <p className="mt-1">
-              Epoch loss and validation curves appear only when real training logs are uploaded.
+              Epoch training and validation loss curves populate automatically when you train{' '}
+              <strong className="text-[#203653]">DistilBERT</strong> or{' '}
+              <strong className="text-[#203653]">BERT-Base</strong> above.
             </p>
           </div>
         ) : (
-          <div className="grid gap-6 lg:grid-cols-12 items-start">
-            <div className="lg:col-span-6 space-y-2">
-              <div className="text-xs font-medium text-[#334155]">
-                Training vs. Validation Loss ({trainingHistory.fileName})
+          <div className="space-y-4">
+            <div className="grid gap-6 lg:grid-cols-12 items-start">
+              <div className="lg:col-span-6">
+                <PlotlyChart data={historyPlot.data} layout={historyPlot.layout} />
               </div>
-              <svg
-                viewBox="0 0 360 220"
-                role="img"
-                aria-label="Training and validation loss per epoch"
-                className="w-full h-auto rounded-lg bg-[#F8FAFC] border border-[#E2E8F0]"
-              >
-                <line x1="44" y1="184" x2="336" y2="184" stroke="#CBD5E1" strokeWidth="1" />
-                <line x1="44" y1="20" x2="44" y2="184" stroke="#CBD5E1" strokeWidth="1" />
-                {(['trainLoss', 'evalLoss'] as const).map((field, sIdx) => {
-                  const validPts = trainingHistory.epochs.filter((ep) => ep[field] !== null);
-                  if (validPts.length === 0) return null;
-                  const minEp = trainingHistory.epochs[0].epoch;
-                  const maxEp = trainingHistory.epochs[trainingHistory.epochs.length - 1].epoch;
-                  const epSpan = Math.max(maxEp - minEp, 1);
-                  const d = validPts
-                    .map((ep, idx) => {
-                      const x = 44 + ((ep.epoch - minEp) / epSpan) * 292;
-                      const y = 184 - (((ep[field] as number) - minLoss) / lossSpan) * 164;
-                      return `${idx === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
-                    })
-                    .join(' ');
-                  return (
-                    <path
-                      key={field}
-                      d={d}
-                      fill="none"
-                      stroke={sIdx === 0 ? '#0F2942' : '#0D7377'}
-                      strokeWidth="2.2"
-                    />
-                  );
-                })}
-                <text x="190" y="208" textAnchor="middle" fontSize="10" fill="#64748B">
-                  Epoch
-                </text>
-                <text
-                  x="14"
-                  y="102"
-                  textAnchor="middle"
-                  fontSize="10"
-                  fill="#64748B"
-                  transform="rotate(-90 14 102)"
-                >
-                  Loss
-                </text>
-              </svg>
-              <div className="flex gap-4 text-xs text-[#475569]">
-                <span className="inline-flex items-center gap-1.5">
-                  <span className="inline-block h-2.5 w-2.5 rounded-xs bg-[#0F2942]" />
-                  <span>Training Loss</span>
-                </span>
-                <span className="inline-flex items-center gap-1.5">
-                  <span className="inline-block h-2.5 w-2.5 rounded-xs bg-[#0D7377]" />
-                  <span>Validation Loss</span>
-                </span>
-              </div>
-            </div>
-
-            <div className="lg:col-span-6 overflow-x-auto">
-              <table className="w-full text-left border-collapse text-xs">
-                <thead>
-                  <tr className="border-b border-[#E2E8F0] text-[#64748B]">
-                    <th className="py-2 pr-3">Epoch</th>
-                    <th className="py-2 pr-3 text-right">Train Loss</th>
-                    <th className="py-2 pr-3 text-right">Val Loss</th>
-                    <th className="py-2 pr-3 text-right">Val Acc</th>
-                    <th className="py-2 text-right">Val F1</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-[#E2E8F0]">
-                  {trainingHistory.epochs.map((ep) => (
-                    <tr key={ep.epoch}>
-                      <td className="py-2 pr-3 font-mono tabular-nums text-[#0F172A]">{ep.epoch}</td>
-                      <td className="py-2 pr-3 text-right font-mono tabular-nums text-[#334155]">
-                        {ep.trainLoss !== null ? ep.trainLoss.toFixed(4) : '—'}
-                      </td>
-                      <td className="py-2 pr-3 text-right font-mono tabular-nums text-[#334155]">
-                        {ep.evalLoss !== null ? ep.evalLoss.toFixed(4) : '—'}
-                      </td>
-                      <td className="py-2 pr-3 text-right font-mono tabular-nums text-[#334155]">
-                        {ep.evalAccuracy !== null ? `${(ep.evalAccuracy * 100).toFixed(2)}%` : '—'}
-                      </td>
-                      <td className="py-2 text-right font-mono tabular-nums font-semibold text-[#0F2942]">
-                        {ep.evalF1 !== null ? ep.evalF1.toFixed(4) : '—'}
-                      </td>
+              <div className="lg:col-span-6 overflow-x-auto">
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr className="border-b border-[#AFC5F5]/55 text-[#526783]">
+                      <th className="py-2 pr-3">Epoch</th>
+                      <th className="py-2 pr-3 text-right">Train Loss</th>
+                      <th className="py-2 pr-3 text-right">Val Loss</th>
+                      <th className="py-2 pr-3 text-right">Val Acc</th>
+                      <th className="py-2 text-right">Val F1</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody className="divide-y divide-[#AFC5F5]/45">
+                    {trainingHistory.epochs.map((ep) => (
+                      <tr key={ep.epoch} className="hover:bg-[#E5ECFF]/70 transition-colors">
+                        <td className="py-2 pr-3 font-mono tabular-nums text-[#203653]">
+                          {ep.epoch}
+                        </td>
+                        <td className="py-2 pr-3 text-right font-mono tabular-nums text-[#526783]">
+                          {ep.trainLoss !== null ? ep.trainLoss.toFixed(4) : '—'}
+                        </td>
+                        <td className="py-2 pr-3 text-right font-mono tabular-nums text-[#526783]">
+                          {ep.evalLoss !== null ? ep.evalLoss.toFixed(4) : '—'}
+                        </td>
+                        <td className="py-2 pr-3 text-right font-mono tabular-nums text-[#526783]">
+                          {ep.evalAccuracy !== null
+                            ? `${(ep.evalAccuracy * 100).toFixed(2)}%`
+                            : '—'}
+                        </td>
+                        <td className="py-2 text-right font-mono tabular-nums font-semibold text-[#203653]">
+                          {ep.evalF1 !== null ? ep.evalF1.toFixed(4) : '—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
+            <p className="text-xs leading-relaxed text-[#526783]">
+              <strong className="text-[#203653]">How to read this chart:</strong> Both training and
+              validation loss should decline together across epochs. If validation loss starts
+              increasing while training loss keeps dropping, early stopping halts training to prevent
+              memorizing training noise.
+            </p>
           </div>
         )}
       </section>
+
+      {/* Optional Advanced Options (External CLI CSV Uploads) */}
+      <details className="group neu-card">
+        <summary className="flex cursor-pointer list-none items-center justify-between px-7 py-5 text-xs font-semibold text-[#203653] select-none">
+          <span>Advanced Options (Optional Custom Evaluation & Training History CSVs)</span>
+          <ChevronDown className="h-4 w-4 text-[#4D6FAF] transition-transform group-open:rotate-180" />
+        </summary>
+
+        <div className="border-t border-[#AFC5F5]/55 p-7 space-y-5 text-xs">
+          <div className="grid gap-6 md:grid-cols-2">
+            <div className="space-y-3">
+              <div className="font-semibold text-[#203653]">
+                Inspect External Held-Out Predictions CSV
+              </div>
+              <p className="text-[#526783]">
+                Optionally inspect held-out prediction files (<code className="font-mono">true_label</code>,{' '}
+                <code className="font-mono">predicted_label</code>) exported from offline Python CLI
+                scripts.
+              </p>
+
+              <div className="flex flex-wrap items-end gap-3">
+                <div>
+                  <label
+                    htmlFor="run-preset-select"
+                    className="block text-[11px] font-medium text-[#526783] mb-1"
+                  >
+                    Model Label
+                  </label>
+                  <select
+                    id="run-preset-select"
+                    value={presetLabel}
+                    onChange={(e) =>
+                      setPresetLabel(e.target.value as 'DistilBERT' | 'BERT-base' | 'custom')
+                    }
+                    className="neu-input px-3 py-2 text-xs text-[#203653]"
+                  >
+                    <option value="DistilBERT">DistilBERT</option>
+                    <option value="BERT-base">BERT-base</option>
+                    <option value="custom">Custom Model</option>
+                  </select>
+                </div>
+
+                {presetLabel === 'custom' && (
+                  <div>
+                    <label
+                      htmlFor="custom-run-input"
+                      className="block text-[11px] font-medium text-[#526783] mb-1"
+                    >
+                      Custom Name
+                    </label>
+                    <input
+                      id="custom-run-input"
+                      type="text"
+                      value={customLabel}
+                      onChange={(e) => setCustomLabel(e.target.value)}
+                      placeholder="e.g. RoBERTa"
+                      className="neu-input w-36 px-3 py-2 text-xs text-[#203653]"
+                    />
+                  </div>
+                )}
+
+                <label className="neu-btn inline-flex cursor-pointer items-center gap-2 px-4 py-2 text-xs font-medium whitespace-nowrap">
+                  <Upload className="h-3.5 w-3.5 text-[#4D6FAF]" aria-hidden="true" />
+                  <span>Load Evaluation CSV</span>
+                  <input
+                    type="file"
+                    accept=".csv,text/csv"
+                    onChange={handleUploadEvalCsv}
+                    className="sr-only"
+                  />
+                </label>
+              </div>
+
+              {lastParsedCsv && activeRun && (
+                <div className="pt-2 grid gap-3 sm:grid-cols-2">
+                  <div>
+                    <label htmlFor="true-col-select" className="block text-[#526783] mb-1">
+                      Ground Truth Column
+                    </label>
+                    <select
+                      id="true-col-select"
+                      value={trueCol}
+                      onChange={(e) => handleRecomputeColumns(e.target.value, predCol)}
+                      className="neu-input w-full px-3 py-1.5 text-xs text-[#203653]"
+                    >
+                      {lastParsedCsv.data.headers.map((h) => (
+                        <option key={h} value={h}>
+                          {h}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label htmlFor="pred-col-select" className="block text-[#526783] mb-1">
+                      Predicted Label Column
+                    </label>
+                    <select
+                      id="pred-col-select"
+                      value={predCol}
+                      onChange={(e) => handleRecomputeColumns(trueCol, e.target.value)}
+                      className="neu-input w-full px-3 py-1.5 text-xs text-[#203653]"
+                    >
+                      {lastParsedCsv.data.headers.map((h) => (
+                        <option key={h} value={h}>
+                          {h}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-3">
+              <div className="font-semibold text-[#203653]">
+                Inspect External Training History CSV
+              </div>
+              <p className="text-[#526783]">
+                Optionally inspect a <code className="font-mono">training_history.csv</code> exported
+                from an external PyTorch run.
+              </p>
+              <label className="neu-btn inline-flex cursor-pointer items-center gap-2 px-4 py-2 text-xs font-medium">
+                <Upload className="h-3.5 w-3.5 text-[#4D6FAF]" aria-hidden="true" />
+                <span>Load Training History CSV</span>
+                <input
+                  type="file"
+                  accept=".csv,text/csv"
+                  onChange={handleUploadTrainingHistory}
+                  className="sr-only"
+                />
+              </label>
+              {historyError && (
+                <div
+                  className="neu-inset p-3 text-xs text-[#6B2A3A]"
+                  style={{ background: '#F6E9ED' }}
+                >
+                  {historyError}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </details>
     </div>
   );
 }

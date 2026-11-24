@@ -29,7 +29,9 @@ export function computeDatasetAnalytics(
   textCol: string,
   labelCol: string,
   fileName: string,
-  splitCol?: string
+  splitCol?: string,
+  datasetName?: string,
+  datasetSource?: string
 ): DatasetSummary {
   const totalRows = rows.length;
   let missingTextRows = 0;
@@ -104,6 +106,12 @@ export function computeDatasetAnalytics(
     }))
     .sort((a, b) => b.count - a.count);
 
+  const majorityClass = classCounts[0]?.label ?? '';
+  const minorityClass = classCounts[classCounts.length - 1]?.label ?? '';
+  const maxCnt = classCounts[0]?.count ?? 0;
+  const minCnt = classCounts[classCounts.length - 1]?.count ?? 0;
+  const imbalanceRatio = minCnt > 0 ? maxCnt / minCnt : 0;
+
   const splitBreakdown: SplitBreakdownItem[] | null =
     splitCounter.size > 0
       ? Array.from(splitCounter.entries())
@@ -148,6 +156,8 @@ export function computeDatasetAnalytics(
 
   return {
     fileName,
+    datasetName: datasetName?.trim() || fileName.replace(/\.csv$/i, ''),
+    datasetSource: datasetSource?.trim() || 'User-supplied local CSV file',
     totalRows,
     validRows: validPairs.length,
     missingTextRows,
@@ -156,6 +166,9 @@ export function computeDatasetAnalytics(
     shortTextCount,
     longTextCount,
     numClasses: classCounts.length,
+    imbalanceRatio,
+    majorityClass,
+    minorityClass,
     classCounts,
     splitBreakdown,
     lengthStats: {

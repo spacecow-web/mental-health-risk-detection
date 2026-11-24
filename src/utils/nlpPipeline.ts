@@ -13,8 +13,11 @@ const HASHTAG_REGEX = /#([A-Za-z0-9_]+)/g;
 const CONTROL_CHARS_REGEX = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
 const MULTI_SPACE_REGEX = /\s+/g;
 
+const IMMEDIATE_SELF_HARM_REGEX =
+  /\b(suicid\w*|kill myself|end my life|take my own life|self[- ]?harm|hurt myself|harm myself|cutting myself|want to die|wish i were dead|better off dead|don'?t want to live|no reason to live|can'?t go on|ending it all|overdose|immediate danger)\b/i;
+
 const SUPPORTIVE_CUE_REGEX =
-  /\b(suicid\w*|kill myself|end my life|self[- ]?harm|hopeless|worthless|can'?t go on|want to die|overwhelmed|panic attack|depress\w*|severe anxiety)\b/i;
+  /\b(hopeless|worthless|overwhelmed|panic attack|depress\w*|severe anxiety)\b/i;
 
 const COMMON_SUFFIXES = ['ation', 'ments', 'ness', 'ing', 'ers', 'ies', 'ied', 'ed', 'ly', 'es', 's'];
 
@@ -35,7 +38,7 @@ export function validateInputText(text: string, minChars = 10, maxChars = 2000):
   if (charCount === 0) {
     return {
       isValid: false,
-      errorMessage: 'Enter or paste social media text before running preprocessing or analysis.',
+      errorMessage: 'Please write or paste some text before clicking Analyse Text.',
       warnings: [],
       charCount: 0,
       wordCount: 0,
@@ -45,7 +48,7 @@ export function validateInputText(text: string, minChars = 10, maxChars = 2000):
   if (charCount < minChars) {
     return {
       isValid: false,
-      errorMessage: `Input is too short (${charCount} characters). Provide at least ${minChars} characters for contextual tokenization.`,
+      errorMessage: `Please share a little more text (at least ${minChars} characters) so there is enough context to look at.`,
       warnings: [],
       charCount,
       wordCount,
@@ -55,12 +58,12 @@ export function validateInputText(text: string, minChars = 10, maxChars = 2000):
   const warnings: string[] = [];
   if (charCount > maxChars) {
     warnings.push(
-      `Text length (${charCount} chars) exceeds ${maxChars} characters; Transformer encoders truncate sequences beyond 256 subword tokens.`
+      `Your text is quite long (${charCount} characters). Only the first portion will be reviewed at once.`
     );
   }
   if (wordCount < 4) {
     warnings.push(
-      'Short text (< 4 words) provides minimal contextual signal and typically yields high predictive uncertainty.'
+      'Very short notes give only a little context, so the result may be less certain.'
     );
   }
 
@@ -162,7 +165,14 @@ export function previewWordPieceTokens(cleanedText: string, maxSeqLength = 256):
   };
 }
 
+export function detectImmediateSelfHarmCues(text: string): boolean {
+  return Boolean(text && IMMEDIATE_SELF_HARM_REGEX.test(text));
+}
+
 export function detectSupportiveCues(text: string, predictedLabel = ''): boolean {
+  if (detectImmediateSelfHarmCues(text)) {
+    return true;
+  }
   if (text && SUPPORTIVE_CUE_REGEX.test(text)) {
     return true;
   }

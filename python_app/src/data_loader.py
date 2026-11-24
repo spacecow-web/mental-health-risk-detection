@@ -1,20 +1,20 @@
-"""Dataset loading, inspection, deduplication, leakage-free splitting, and class weighting."""
+"""Dataset loading, auto-discovery, inspection, deduplication, leakage-free splitting, and class weighting."""
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 
-from src.config import PreprocessingConfig
+from src.config import DEFAULT_DATA_DIR, DEFAULT_DATASET_CSV, PreprocessingConfig
 from src.preprocessing import preprocess_text
 
 
 REQUIRED_DATASET_GUIDE = """
-No labeled dataset was supplied. MindTrace AI requires a UTF-8 CSV file containing at least:
+Place a labeled UTF-8 CSV dataset at `data/default_dataset.csv` containing at least:
   1. A text column (default: 'text') holding raw social media posts.
   2. A target label column (default: 'label') holding categorical class labels
      (binary e.g. Non-Distress / Distress, or multi-class e.g. Neutral / Stress / Anxiety / Depression).
@@ -27,7 +27,7 @@ Example CSV structure:
 
 
 class DatasetNotSuppliedError(FileNotFoundError):
-    """Raised when a required labeled CSV dataset is missing or unreadable."""
+    """Raised when a configured or required labeled CSV dataset is missing or unreadable."""
 
 
 @dataclass
@@ -58,6 +58,47 @@ class PreparedSplits:
     removed_duplicate_rows: int
 
 
+def resolve_default_dataset_path(
+    data_dir: Path = DEFAULT_DATA_DIR,
+    preferred_path: Path = DEFAULT_DATASET_CSV,
+) -> Optional[Path]:
+    """Return the configured default dataset CSV path if present on disk."""
+    if preferred_path.exists() and preferred_path.is_file():
+        return preferred_path
+    if data_dir.exists() and data_dir.is_dir():
+        excluded = {"held_out_predictions.csv", "training_history.csv"}
+        candidates = sorted(
+            p for p in data_dir.glob("*.csv") if p.is_file() and p.name not in excluded
+        )
+        if candidates:
+            return candidates[0]
+    return None
+
+
+def detect_dataset_columns(df: pd.DataFrame) -> Tuple[str, str, Optional[str]]:
+    """Auto-detect text, label, and optional split column names from a CSV header."""
+    cols = list(df.columns)
+    lower_map = {c.lower(): c for c in cols}
+
+    text_col = (
+        lower_map.get("text")
+        or next((c for c in cols if "text" in c.lower() or "post" in c.lower()), cols[0])
+    )
+    label_col = (
+        lower_map.get("label")
+        or next(
+            (c for c in cols if "label" in c.lower() or "class" in c.lower()),
+            cols[min(1, len(cols) - 1)],
+        )
+    )
+    split_col = (
+        lower_map.get("split")
+        or lower_map.get("subset")
+        or lower_map.get("partition")
+    )
+    return text_col, label_col, split_col
+
+
 def load_labeled_dataset(
     data_path: str | Path,
     text_col: str = "text",
@@ -65,7 +106,7 @@ def load_labeled_dataset(
 ) -> pd.DataFrame:
     """Load a labeled social media CSV dataset and verify required columns exist.
 
-    Raises DatasetNotSuppliedError with dataset schema instructions if the file is missing.
+    Raises DatasetNotSuppliedError with schema instructions if the file is missing.
     """
     path = Path(data_path)
     if not path.exists() or not path.is_file():
@@ -141,7 +182,6 @@ def clean_and_deduplicate_dataset(
     cleaned_df = cleaned_df[cleaned_df["cleaned_text"].str.len() >= prep_config.min_chars].copy()
     removed_invalid = initial_count - len(cleaned_df)
 
-    # Canonical key for duplicate detection across case/whitespace differences
     cleaned_df["_dedup_key"] = cleaned_df["cleaned_text"].str.lower().str.strip()
     before_dedup = len(cleaned_df)
     cleaned_df = cleaned_df.drop_duplicates(subset=["_dedup_key"], keep="first").drop(
@@ -198,7 +238,6 @@ def stratified_train_val_test_split(
         stratify=temp_df["label_id"],
     )
 
-    # Strict zero-leakage verification across splits
     train_texts = set(train_df["cleaned_text"].str.lower())
     val_texts = set(val_df["cleaned_text"].str.lower())
     test_texts = set(test_df["cleaned_text"].str.lower())

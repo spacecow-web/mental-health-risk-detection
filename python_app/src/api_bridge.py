@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from src.config import AppConfig, PreprocessingConfig
-from src.ethics import should_show_supportive_guidance
+from src.ethics import detect_immediate_self_harm_cues, should_show_supportive_guidance
 from src.explainability import ExplainabilityEngine
 from src.model_inference import MentalHealthTransformerClassifier, ModelNotReadyError
 from src.preprocessing import preprocess_text, validate_text
@@ -28,6 +28,8 @@ class AnalyzeRequest(BaseModel):
     method: Literal["SHAP", "LIME"] = "SHAP"
     mask_urls: bool = True
     anonymize_mentions: bool = True
+    strip_hashtag_symbol: bool = True
+    normalize_whitespace: bool = True
     lowercase: bool = False
 
 
@@ -45,10 +47,11 @@ def get_explainer() -> ExplainabilityEngine:
 def health() -> Dict[str, object]:
     try:
         clf = get_classifier()
+        meta = clf.training_metadata or {}
         return {
             "ready": True,
             "labels": clf.class_names,
-            "model": clf.config.backbone_name,
+            "model": meta.get("backbone", clf.config.backbone_name),
             "training_metadata": clf.training_metadata,
         }
     except ModelNotReadyError as exc:
@@ -60,6 +63,8 @@ def analyze(req: AnalyzeRequest) -> Dict[str, object]:
     prep_cfg = PreprocessingConfig(
         mask_urls=req.mask_urls,
         anonymize_mentions=req.anonymize_mentions,
+        strip_hashtag_symbol=req.strip_hashtag_symbol,
+        normalize_whitespace=req.normalize_whitespace,
         lowercase=req.lowercase,
     )
     validation = validate_text(req.text, prep_cfg)
@@ -105,6 +110,7 @@ def analyze(req: AnalyzeRequest) -> Dict[str, object]:
             for a in report.attributions
         ],
         "natural_language_summary": report.natural_language_summary,
+        "immediate_safety": detect_immediate_self_harm_cues(req.text),
         "supportive_guidance": should_show_supportive_guidance(
             req.text, prediction.predicted_label, AppConfig().distress_label_keywords
         ),

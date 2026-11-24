@@ -1,23 +1,65 @@
-import { useEffect, useState, type ChangeEvent } from 'react';
-import { Upload } from 'lucide-react';
+import { useEffect, useMemo, useState, type ChangeEvent } from 'react';
+import { ArrowRight, ChevronDown, RefreshCw, RotateCcw, Upload } from 'lucide-react';
+import type { Data, Layout } from 'plotly.js';
 import { PageHeader } from '@/src/components/PageHeader';
-import type { DatasetSummary } from '@/src/types/mindtrace';
+import { PlotlyChart } from '@/src/components/PlotlyChart';
+import type {
+  CorpusRecord,
+  DatasetSummary,
+  LoadedCorpusData,
+} from '@/src/types/mindtrace';
 import { parseCsvContent, type ParsedCsv } from '@/src/utils/csvParser';
 import { computeDatasetAnalytics } from '@/src/utils/datasetAnalytics';
 
 interface DatasetAnalyticsPageProps {
   datasetSummary: DatasetSummary | null;
-  onSetDatasetSummary: (summary: DatasetSummary | null) => void;
+  loadingDefaultDataset: boolean;
+  defaultDatasetError: string | null;
+  isCustomDatasetActive: boolean;
+  onRetryDefaultDataset: () => void;
+  onApplyCustomDataset: (summary: DatasetSummary, corpus: LoadedCorpusData) => void;
+  onOpenModelPerformance?: () => void;
+  embedded?: boolean;
+}
+
+const BLUE_BAR_COLORS = ['#4D6FAF', '#72B9D8', '#7799D8', '#91B9E8', '#AFC5F5'];
+
+function buildCorpusRows(
+  rows: Record<string, string>[],
+  tCol: string,
+  lCol: string,
+  sCol?: string
+): CorpusRecord[] {
+  const result: CorpusRecord[] = [];
+  for (const r of rows) {
+    const text = (r[tCol] ?? '').trim();
+    const label = (r[lCol] ?? '').trim();
+    if (!text || !label) continue;
+    result.push({
+      text,
+      label,
+      split: sCol ? (r[sCol] ?? '').trim() || undefined : undefined,
+    });
+  }
+  return result;
 }
 
 export function DatasetAnalyticsPage({
   datasetSummary,
-  onSetDatasetSummary,
+  loadingDefaultDataset,
+  defaultDatasetError,
+  isCustomDatasetActive,
+  onRetryDefaultDataset,
+  onApplyCustomDataset,
+  onOpenModelPerformance,
+  embedded = false,
 }: DatasetAnalyticsPageProps) {
   const [parsedCsv, setParsedCsv] = useState<{ fileName: string; data: ParsedCsv } | null>(null);
   const [textCol, setTextCol] = useState('text');
   const [labelCol, setLabelCol] = useState('label');
   const [splitCol, setSplitCol] = useState('');
+  const [datasetNameInput, setDatasetNameInput] = useState('');
+  const [datasetSourceInput, setDatasetSourceInput] = useState('Custom local research CSV');
   const [selectedClass, setSelectedClass] = useState<string>('');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -28,6 +70,12 @@ export function DatasetAnalyticsPage({
       }
     }
   }, [datasetSummary, selectedClass]);
+
+  function handleRestoreDefault() {
+    setParsedCsv(null);
+    setErrorMsg(null);
+    onRetryDefaultDataset();
+  }
 
   async function handleFileUpload(e: ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -48,19 +96,28 @@ export function DatasetAnalyticsPage({
       const detectedSplit =
         headers.find((h) => ['split', 'subset', 'partition'].includes(h.toLowerCase())) ?? '';
 
+      const defaultName = file.name.replace(/\.csv$/i, '');
       setParsedCsv({ fileName: file.name, data: parsed });
       setTextCol(detectedText);
       setLabelCol(detectedLabel);
       setSplitCol(detectedSplit);
+      setDatasetNameInput(defaultName);
 
       const summary = computeDatasetAnalytics(
         parsed.rows,
         detectedText,
         detectedLabel,
         file.name,
-        detectedSplit || undefined
+        detectedSplit || undefined,
+        defaultName,
+        datasetSourceInput
       );
-      onSetDatasetSummary(summary);
+      onApplyCustomDataset(summary, {
+        datasetName: summary.datasetName,
+        datasetSource: summary.datasetSource,
+        fileName: file.name,
+        rows: buildCorpusRows(parsed.rows, detectedText, detectedLabel, detectedSplit || undefined),
+      });
       setSelectedClass(summary.classCounts[0]?.label ?? '');
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Unable to parse dataset CSV.');
@@ -69,7 +126,29 @@ export function DatasetAnalyticsPage({
     }
   }
 
-  function handleRecompute(nextTextCol: string, nextLabelCol: string, nextSplitCol: string) {
+  function handleMetadataChange(nextName: string, nextSource: string) {
+    setDatasetNameInput(nextName);
+    setDatasetSourceInput(nextSource);
+    if (datasetSummary && parsedCsv) {
+      const updated: DatasetSummary = {
+        ...datasetSummary,
+        datasetName: nextName.trim() || datasetSummary.fileName.replace(/\.csv$/i, ''),
+        datasetSource: nextSource.trim() || 'Custom local research CSV',
+      };
+      onApplyCustomDataset(updated, {
+        datasetName: updated.datasetName,
+        datasetSource: updated.datasetSource,
+        fileName: parsedCsv.fileName,
+        rows: buildCorpusRows(parsedCsv.data.rows, textCol, labelCol, splitCol || undefined),
+      });
+    }
+  }
+
+  function handleRecompute(
+    nextTextCol: string,
+    nextLabelCol: string,
+    nextSplitCol: string
+  ) {
     setTextCol(nextTextCol);
     setLabelCol(nextLabelCol);
     setSplitCol(nextSplitCol);
@@ -81,315 +160,366 @@ export function DatasetAnalyticsPage({
         nextTextCol,
         nextLabelCol,
         parsedCsv.fileName,
-        nextSplitCol || undefined
+        nextSplitCol || undefined,
+        datasetNameInput,
+        datasetSourceInput
       );
-      onSetDatasetSummary(summary);
+      onApplyCustomDataset(summary, {
+        datasetName: summary.datasetName,
+        datasetSource: summary.datasetSource,
+        fileName: parsedCsv.fileName,
+        rows: buildCorpusRows(
+          parsedCsv.data.rows,
+          nextTextCol,
+          nextLabelCol,
+          nextSplitCol || undefined
+        ),
+      });
       setSelectedClass(summary.classCounts[0]?.label ?? '');
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Invalid column mapping.');
     }
   }
 
-  const maxClassCount = datasetSummary
-    ? Math.max(...datasetSummary.classCounts.map((c) => c.count), 1)
-    : 1;
-  const maxBinCount = datasetSummary
-    ? Math.max(...datasetSummary.histogramBins.map((b) => b.count), 1)
-    : 1;
+  const classPlot = useMemo<{ data: Data[]; layout: Partial<Layout> } | null>(() => {
+    if (!datasetSummary) return null;
+    return {
+      data: [
+        {
+          type: 'bar',
+          x: datasetSummary.classCounts.map((c) => c.label),
+          y: datasetSummary.classCounts.map((c) => c.count),
+          text: datasetSummary.classCounts.map((c) => `${c.count} (${c.sharePercent.toFixed(1)}%)`),
+          textposition: 'auto',
+          textfont: { color: '#203653', size: 12 },
+          marker: {
+            color: datasetSummary.classCounts.map(
+              (_, i) => BLUE_BAR_COLORS[i % BLUE_BAR_COLORS.length]
+            ),
+            line: { color: '#EAF0FF', width: 1 },
+          },
+          hovertemplate: '%{x}<br>Records: %{y}<extra></extra>',
+        },
+      ],
+      layout: {
+        height: 320,
+        xaxis: { title: { text: 'Category Label' } },
+        yaxis: { title: { text: 'Usable Records' } },
+        margin: { l: 56, r: 20, t: 20, b: 56 },
+      },
+    };
+  }, [datasetSummary]);
 
-  const projectedTrain = datasetSummary ? Math.round(datasetSummary.validRows * 0.7) : 0;
-  const projectedVal = datasetSummary ? Math.round(datasetSummary.validRows * 0.15) : 0;
-  const projectedTest = datasetSummary
-    ? Math.max(0, datasetSummary.validRows - projectedTrain - projectedVal)
-    : 0;
+  const lengthPlot = useMemo<{ data: Data[]; layout: Partial<Layout> } | null>(() => {
+    if (!datasetSummary) return null;
+    return {
+      data: [
+        {
+          type: 'bar',
+          x: datasetSummary.histogramBins.map((b) => `${b.rangeLabel} w`),
+          y: datasetSummary.histogramBins.map((b) => b.count),
+          marker: {
+            color: '#72B9D8',
+            line: { color: '#EAF0FF', width: 1 },
+          },
+          hovertemplate: 'Range: %{x}<br>Posts: %{y}<extra></extra>',
+        },
+      ],
+      layout: {
+        height: 320,
+        xaxis: { title: { text: 'Word Count Bin' } },
+        yaxis: { title: { text: 'Number of Posts' } },
+        margin: { l: 56, r: 20, t: 20, b: 56 },
+      },
+    };
+  }, [datasetSummary]);
+
+  const splitPlot = useMemo<{ data: Data[]; layout: Partial<Layout> } | null>(() => {
+    if (!datasetSummary) return null;
+    const labels = datasetSummary.splitBreakdown
+      ? datasetSummary.splitBreakdown.map((s) => s.split)
+      : ['Train (70%)', 'Validation (15%)', 'Test (15%)'];
+    const counts = datasetSummary.splitBreakdown
+      ? datasetSummary.splitBreakdown.map((s) => s.count)
+      : (() => {
+          const tr = Math.round(datasetSummary.validRows * 0.7);
+          const va = Math.round(datasetSummary.validRows * 0.15);
+          return [tr, va, Math.max(0, datasetSummary.validRows - tr - va)];
+        })();
+
+    return {
+      data: [
+        {
+          type: 'bar',
+          x: labels,
+          y: counts,
+          text: counts.map((c) => String(c)),
+          textposition: 'auto',
+          textfont: { color: '#203653', size: 12 },
+          marker: {
+            color: labels.map((_, i) => BLUE_BAR_COLORS[i % BLUE_BAR_COLORS.length]),
+            line: { color: '#EAF0FF', width: 1 },
+          },
+          hovertemplate: '%{x}: %{y} records<extra></extra>',
+        },
+      ],
+      layout: {
+        height: 290,
+        xaxis: { title: { text: 'Dataset Split' } },
+        yaxis: { title: { text: 'Records' } },
+        margin: { l: 56, r: 20, t: 20, b: 56 },
+      },
+    };
+  }, [datasetSummary]);
+
+  const imbalanceSeverity = !datasetSummary
+    ? ''
+    : datasetSummary.imbalanceRatio < 1.5
+    ? 'Balanced (< 1.5x)'
+    : datasetSummary.imbalanceRatio <= 3.0
+    ? 'Moderate Imbalance (1.5x – 3.0x)'
+    : 'Severe Imbalance (> 3.0x)';
 
   return (
-    <div className="space-y-6">
-      <PageHeader
-        title="Dataset Analytics"
-        description="Inspect corpus size, class balance, text length distributions, train/validation/test split ratios, and data quality diagnostics."
-        action={
-          <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg bg-[#0F2942] px-4 py-2.5 text-xs font-medium text-white hover:bg-[#173A5E] transition-colors whitespace-nowrap min-h-[40px]">
-            <Upload className="h-3.5 w-3.5" aria-hidden="true" />
-            <span>{datasetSummary ? 'Replace Dataset CSV' : 'Upload Dataset CSV'}</span>
-            <input type="file" accept=".csv,text/csv" onChange={handleFileUpload} className="sr-only" />
-          </label>
-        }
-      />
-
-      {parsedCsv && (
-        <section className="rounded-xl border border-[#E2E8F0] bg-white p-5 grid gap-4 sm:grid-cols-4 text-xs">
-          <div>
-            <span className="block text-[#64748B] mb-1">Active Corpus</span>
-            <span className="font-mono font-medium text-[#0F172A] break-all">
-              {parsedCsv.fileName}
-            </span>
-          </div>
-          <div>
-            <label htmlFor="corpus-text-col" className="block text-[#64748B] mb-1">
-              Text Column
-            </label>
-            <select
-              id="corpus-text-col"
-              value={textCol}
-              onChange={(e) => handleRecompute(e.target.value, labelCol, splitCol)}
-              className="w-full rounded-lg border border-[#CBD5E1] bg-white px-3 py-1.5 text-xs text-[#0F172A]"
-            >
-              {parsedCsv.data.headers.map((h) => (
-                <option key={h} value={h}>
-                  {h}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label htmlFor="corpus-label-col" className="block text-[#64748B] mb-1">
-              Label Column
-            </label>
-            <select
-              id="corpus-label-col"
-              value={labelCol}
-              onChange={(e) => handleRecompute(textCol, e.target.value, splitCol)}
-              className="w-full rounded-lg border border-[#CBD5E1] bg-white px-3 py-1.5 text-xs text-[#0F172A]"
-            >
-              {parsedCsv.data.headers.map((h) => (
-                <option key={h} value={h}>
-                  {h}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label htmlFor="corpus-split-col" className="block text-[#64748B] mb-1">
-              Split Column (Optional)
-            </label>
-            <select
-              id="corpus-split-col"
-              value={splitCol}
-              onChange={(e) => handleRecompute(textCol, labelCol, e.target.value)}
-              className="w-full rounded-lg border border-[#CBD5E1] bg-white px-3 py-1.5 text-xs text-[#0F172A]"
-            >
-              <option value="">None (use 70/15/15 stratified plan)</option>
-              {parsedCsv.data.headers.map((h) => (
-                <option key={h} value={h}>
-                  {h}
-                </option>
-              ))}
-            </select>
-          </div>
-        </section>
+    <div className="space-y-7">
+      {!embedded && (
+        <PageHeader
+          title="Dataset Analytics"
+          description="Automatic inspection of the configured benchmark corpus: record counts, class imbalance, train/validation/test splits, text length distributions, missing values, and duplicate diagnostics."
+        />
       )}
 
       {errorMsg && (
-        <div className="rounded-lg bg-[#FEF2F2] p-3 text-xs text-[#991B1B]">{errorMsg}</div>
+        <div
+          className="neu-inset p-3.5 text-xs text-[#6B2A3A]"
+          style={{ background: '#F6E9ED' }}
+        >
+          {errorMsg}
+        </div>
       )}
 
-      {!datasetSummary ? (
-        <section className="rounded-xl border border-[#E2E8F0] bg-white p-8 max-w-3xl">
-          <div className="text-xs font-mono text-[#0D7377]">
-            Empty State · No Corpus Supplied
-          </div>
-          <h2 className="mt-2 font-display text-lg font-semibold text-[#0F172A]">
-            Upload a Labeled Social Media Dataset CSV
-          </h2>
-          <p className="mt-2 text-sm leading-relaxed text-[#475569]">
-            MindTrace AI never fabricates dataset sizes, class distributions, or quality reports.
-            Upload your labeled CSV file (<code className="font-mono text-xs">text</code>,{' '}
-            <code className="font-mono text-xs">label</code>, optional{' '}
-            <code className="font-mono text-xs">split</code>) to compute real exploratory analytics.
+      {loadingDefaultDataset && !datasetSummary ? (
+        <section className="neu-card p-8 max-w-3xl space-y-2">
+          <div className="text-xs font-mono text-[#4D6FAF]">Loading Configured Dataset...</div>
+          <p className="text-sm text-[#526783]">
+            Reading and analyzing the backend default research dataset automatically.
           </p>
-          <pre className="mt-4 overflow-x-auto rounded-lg bg-[#0F172A] p-3.5 text-xs font-mono text-[#E2E8F0]">
-{`text,label,split
-"I have not slept properly all week and feel overwhelmed by deadlines.",Stress,train
-"Finished my morning coffee and looking forward to the weekend hike.",Neutral,test`}
-          </pre>
+        </section>
+      ) : !datasetSummary ? (
+        <section className="neu-card p-8 max-w-3xl space-y-4">
+          <div className="text-xs font-mono text-[#5C4419]">
+            Default Research Dataset Unavailable
+          </div>
+          <h2 className="font-display text-lg font-semibold text-[#203653]">
+            Unable to Load the Configured Backend Corpus
+          </h2>
+          <p className="text-sm leading-relaxed text-[#526783]">
+            {defaultDatasetError ||
+              'Place a labeled CSV file at data/default_dataset.csv or verify outbound access to the configured Hugging Face corpus, then click Retry.'}
+          </p>
+          <button
+            type="button"
+            onClick={handleRestoreDefault}
+            className="neu-btn-primary inline-flex items-center gap-2 px-4 py-2.5 text-xs min-h-[40px]"
+          >
+            <RefreshCw className="h-3.5 w-3.5 text-white" aria-hidden="true" />
+            <span>Retry Default Dataset</span>
+          </button>
         </section>
       ) : (
         <>
           {/* Dataset Overview KPIs */}
-          <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            {[
-              { label: 'Valid Posts', value: String(datasetSummary.validRows) },
-              { label: 'Distinct Classes', value: String(datasetSummary.numClasses) },
-              {
-                label: 'Median / P95 Words',
-                value: `${datasetSummary.lengthStats.medianWords.toFixed(1)} / ${datasetSummary.lengthStats.p95Words.toFixed(0)}`,
-              },
-              {
-                label: 'Duplicate Texts',
-                value: String(datasetSummary.duplicateTexts),
-              },
-            ].map((stat) => (
-              <div key={stat.label} className="rounded-xl border border-[#E2E8F0] bg-white p-5">
-                <div className="text-xs text-[#64748B]">{stat.label}</div>
-                <div className="mt-1.5 font-mono text-xl font-semibold tabular-nums text-[#0F2942]">
-                  {stat.value}
-                </div>
+          <section className="neu-card-elevated p-7 space-y-5">
+            <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-[#AFC5F5]/55 text-xs">
+              <div>
+                <span className="text-[#526783]">Active Corpus: </span>
+                <span className="font-semibold text-[#203653]">{datasetSummary.datasetName}</span>
+                <span className="mx-2 text-[#91B9E8]" aria-hidden="true">
+                  ·
+                </span>
+                <span className="text-[#526783]">Source: </span>
+                <span className="text-[#203653]">{datasetSummary.datasetSource}</span>
               </div>
-            ))}
+
+              <div className="flex flex-wrap items-center gap-2.5">
+                {isCustomDatasetActive && (
+                  <button
+                    type="button"
+                    onClick={handleRestoreDefault}
+                    className="neu-btn inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium"
+                  >
+                    <RotateCcw className="h-3.5 w-3.5 text-[#4D6FAF]" aria-hidden="true" />
+                    <span>Restore Default Dataset</span>
+                  </button>
+                )}
+                {onOpenModelPerformance && (
+                  <button
+                    type="button"
+                    onClick={onOpenModelPerformance}
+                    className="neu-btn-primary inline-flex items-center gap-1.5 px-4 py-2 text-xs"
+                  >
+                    <span>Evaluate or Train Transformers</span>
+                    <ArrowRight className="h-3.5 w-3.5 text-white" aria-hidden="true" />
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
+              {[
+                { label: 'Total Records', value: String(datasetSummary.totalRows) },
+                { label: 'Usable Records', value: String(datasetSummary.validRows) },
+                { label: 'Number of Classes', value: String(datasetSummary.numClasses) },
+                {
+                  label: 'Missing Values',
+                  value: String(datasetSummary.missingTextRows + datasetSummary.missingLabelRows),
+                },
+                { label: 'Duplicate Records', value: String(datasetSummary.duplicateTexts) },
+                { label: 'Imbalance Ratio', value: `${datasetSummary.imbalanceRatio.toFixed(2)}x` },
+              ].map((stat) => (
+                <div key={stat.label} className="neu-inset p-4">
+                  <div className="text-xs text-[#526783]">{stat.label}</div>
+                  <div className="mt-1 font-mono text-lg font-semibold tabular-nums text-[#203653]">
+                    {stat.value}
+                  </div>
+                </div>
+              ))}
+            </div>
           </section>
 
-          {/* Class Distribution & Text Length Distribution */}
+          {/* Interactive Plotly Class Distribution & Text Length Distribution */}
           <div className="grid gap-6 lg:grid-cols-12">
-            <section className="lg:col-span-6 rounded-xl border border-[#E2E8F0] bg-white p-6 space-y-4">
+            <section className="lg:col-span-6 neu-card p-7 space-y-3">
               <div className="flex items-center justify-between">
-                <h2 className="font-display text-base font-semibold text-[#0F172A]">
+                <h2 className="font-display text-base font-semibold text-[#203653]">
                   Class Distribution
                 </h2>
-                <span className="font-mono text-xs tabular-nums text-[#64748B]">
-                  N={datasetSummary.validRows}
+                <span className="font-mono text-xs tabular-nums text-[#526783]">
+                  {datasetSummary.numClasses} classes
                 </span>
               </div>
-              <div className="space-y-3">
-                {datasetSummary.classCounts.map((item) => (
-                  <div key={item.label} className="space-y-1">
-                    <div className="flex justify-between text-xs">
-                      <span className="font-medium text-[#0F172A]">{item.label}</span>
-                      <span className="font-mono tabular-nums text-[#475569]">
-                        {item.count} ({item.sharePercent.toFixed(1)}%)
-                      </span>
-                    </div>
-                    <div className="h-2.5 w-full rounded-full bg-[#F1F5F9] overflow-hidden">
-                      <div
-                        className="h-full rounded-full bg-[#0F2942]"
-                        style={{ width: `${(item.count / maxClassCount) * 100}%` }}
-                      />
-                    </div>
-                  </div>
-                ))}
-              </div>
+              {classPlot && <PlotlyChart data={classPlot.data} layout={classPlot.layout} />}
+              <p className="text-xs leading-relaxed text-[#526783]">
+                <strong className="text-[#203653]">What this shows:</strong> How many usable posts
+                belong to each category. Balanced bars help the Transformer learn every category
+                evenly without favouring only the most common label.
+              </p>
             </section>
 
-            <section className="lg:col-span-6 rounded-xl border border-[#E2E8F0] bg-white p-6 space-y-4">
+            <section className="lg:col-span-6 neu-card p-7 space-y-3">
               <div className="flex items-center justify-between">
-                <h2 className="font-display text-base font-semibold text-[#0F172A]">
+                <h2 className="font-display text-base font-semibold text-[#203653]">
                   Text Length Distribution
                 </h2>
-                <span className="text-xs font-mono tabular-nums text-[#64748B]">
-                  Mean: {datasetSummary.lengthStats.meanWords.toFixed(1)} words
+                <span className="text-xs font-mono tabular-nums text-[#526783]">
+                  Median: {datasetSummary.lengthStats.medianWords.toFixed(1)} w · P95:{' '}
+                  {datasetSummary.lengthStats.p95Words.toFixed(0)} w
                 </span>
               </div>
-              <div className="space-y-2.5">
-                {datasetSummary.histogramBins.map((bin) => (
-                  <div key={bin.rangeLabel} className="grid grid-cols-12 items-center gap-2 text-xs">
-                    <div className="col-span-3 font-mono tabular-nums text-[#475569]">
-                      {bin.rangeLabel} w
-                    </div>
-                    <div className="col-span-7 h-4 rounded bg-[#F1F5F9] overflow-hidden">
-                      <div
-                        className="h-full rounded bg-[#0D7377]"
-                        style={{ width: `${(bin.count / maxBinCount) * 100}%` }}
-                      />
-                    </div>
-                    <div className="col-span-2 text-right font-mono tabular-nums text-[#0F172A]">
-                      {bin.count}
-                    </div>
-                  </div>
-                ))}
-              </div>
+              {lengthPlot && <PlotlyChart data={lengthPlot.data} layout={lengthPlot.layout} />}
+              <p className="text-xs leading-relaxed text-[#526783]">
+                <strong className="text-[#203653]">What this shows:</strong> How long posts are in
+                words. Short posts may lack context, while very long posts (over ~200 words) approach
+                the Transformer&apos;s 256-token sequence limit and get truncated.
+              </p>
             </section>
           </div>
 
-          {/* Dataset Splitting Information + Data Quality Statistics */}
+          {/* Dataset Split Chart + Class Imbalance & Quality Audit */}
           <div className="grid gap-6 lg:grid-cols-12">
-            <section className="lg:col-span-6 rounded-xl border border-[#E2E8F0] bg-white p-6 space-y-4">
+            <section className="lg:col-span-6 neu-card p-7 space-y-3">
               <div className="flex items-center justify-between">
-                <h2 className="font-display text-base font-semibold text-[#0F172A]">
-                  Dataset Splitting Information
+                <h2 className="font-display text-base font-semibold text-[#203653]">
+                  Training, Validation & Testing Split
                 </h2>
-                <span className="text-xs font-mono text-[#0D7377]">
-                  {datasetSummary.splitBreakdown ? 'Observed Column' : '70 / 15 / 15 Stratified Plan'}
+                <span className="text-xs font-mono text-[#4D6FAF]">
+                  {datasetSummary.splitBreakdown ? 'Observed Split' : '70 / 15 / 15 Stratified Plan'}
                 </span>
               </div>
-
-              {datasetSummary.splitBreakdown ? (
-                <div className="space-y-3">
-                  {datasetSummary.splitBreakdown.map((item) => (
-                    <div key={item.split} className="space-y-1">
-                      <div className="flex justify-between text-xs">
-                        <span className="font-medium capitalize text-[#0F172A]">{item.split}</span>
-                        <span className="font-mono tabular-nums text-[#475569]">
-                          {item.count} ({item.sharePercent.toFixed(1)}%)
-                        </span>
-                      </div>
-                      <div className="h-2.5 w-full rounded-full bg-[#F1F5F9] overflow-hidden">
-                        <div
-                          className="h-full rounded-full bg-[#2563EB]"
-                          style={{ width: `${item.sharePercent}%` }}
-                        />
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  <p className="text-xs leading-relaxed text-[#475569]">
-                    No explicit <code className="font-mono">split</code> column was detected in this
-                    CSV. When passed to <code className="font-mono">src/train.py</code>, stratified
-                    splitting allocates samples as follows:
-                  </p>
-                  <div className="grid grid-cols-3 gap-3">
-                    {[
-                      { name: 'Train (70%)', count: projectedTrain },
-                      { name: 'Validation (15%)', count: projectedVal },
-                      { name: 'Held-Out Test (15%)', count: projectedTest },
-                    ].map((s) => (
-                      <div key={s.name} className="rounded-lg bg-[#F8FAFC] p-3">
-                        <div className="text-[11px] text-[#64748B]">{s.name}</div>
-                        <div className="mt-0.5 font-mono text-base font-semibold tabular-nums text-[#0F2942]">
-                          {s.count}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
+              {splitPlot && <PlotlyChart data={splitPlot.data} layout={splitPlot.layout} />}
+              <p className="text-xs leading-relaxed text-[#526783]">
+                <strong className="text-[#203653]">What this shows:</strong> Records are separated
+                after deduplication into a training set (to fit weights), validation set (for early
+                stopping), and held-out test set (for unbiased evaluation) with zero text overlap.
+              </p>
             </section>
 
-            <section className="lg:col-span-6 rounded-xl border border-[#E2E8F0] bg-white p-6">
-              <h2 className="font-display text-base font-semibold text-[#0F172A] mb-3">
-                Data Quality Statistics
-              </h2>
-              <table className="w-full text-left border-collapse text-xs">
-                <tbody className="divide-y divide-[#E2E8F0]">
-                  {[
-                    ['Total CSV Rows', datasetSummary.totalRows],
-                    ['Valid Non-Empty Rows', datasetSummary.validRows],
-                    ['Missing / Empty Text Rows', datasetSummary.missingTextRows],
-                    ['Missing Label Rows', datasetSummary.missingLabelRows],
-                    ['Exact Duplicate Posts', datasetSummary.duplicateTexts],
-                    ['Short Posts (< 4 words)', datasetSummary.shortTextCount],
-                    ['Long Posts (> 200 words, near 256-token cap)', datasetSummary.longTextCount],
-                    ['Mean Characters / Post', datasetSummary.lengthStats.meanChars.toFixed(1)],
-                  ].map(([k, v]) => (
-                    <tr key={String(k)}>
-                      <td className="py-2 text-[#475569]">{k}</td>
-                      <td className="py-2 text-right font-mono tabular-nums font-medium text-[#0F172A]">
-                        {v}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+            <section className="lg:col-span-6 neu-card p-7 space-y-5">
+              <div>
+                <h2 className="font-display text-base font-semibold text-[#203653]">
+                  Class Imbalance Analysis
+                </h2>
+                <div className="mt-3 neu-inset p-4 space-y-2 text-xs">
+                  <div className="flex justify-between gap-2">
+                    <span className="text-[#526783]">Severity Classification</span>
+                    <span className="font-semibold text-[#203653]">{imbalanceSeverity}</span>
+                  </div>
+                  <div className="flex justify-between gap-2">
+                    <span className="text-[#526783]">Majority vs. Minority Class</span>
+                    <span className="font-mono text-[#203653]">
+                      {datasetSummary.majorityClass} vs. {datasetSummary.minorityClass} (
+                      {datasetSummary.imbalanceRatio.toFixed(2)}x)
+                    </span>
+                  </div>
+                  <p className="pt-1 leading-relaxed text-[#526783]">
+                    When one category appears much more often than another, standard accuracy can
+                    look high even if minority categories are missed. MindTrace AI computes
+                    inverse-frequency class weights on the training split and tracks Macro F1 to
+                    protect minority-class sensitivity.
+                  </p>
+                </div>
+              </div>
+
+              <div>
+                <h3 className="font-display text-sm font-semibold text-[#203653] mb-2">
+                  Missing Values & Data Quality Statistics
+                </h3>
+                <table className="w-full text-left border-collapse text-xs">
+                  <tbody className="divide-y divide-[#AFC5F5]/45">
+                    {[
+                      ['Total Corpus Records', datasetSummary.totalRows],
+                      ['Usable Records (valid text & label)', datasetSummary.validRows],
+                      ['Missing / Empty Text Records', datasetSummary.missingTextRows],
+                      ['Missing Label Records', datasetSummary.missingLabelRows],
+                      ['Exact Duplicate Records', datasetSummary.duplicateTexts],
+                      ['Short Posts (< 4 words)', datasetSummary.shortTextCount],
+                      ['Long Posts (> 200 words)', datasetSummary.longTextCount],
+                      ['Mean Characters / Post', datasetSummary.lengthStats.meanChars.toFixed(1)],
+                    ].map(([k, v]) => (
+                      <tr key={String(k)}>
+                        <td className="py-2 text-[#526783]">{k}</td>
+                        <td className="py-2 text-right font-mono tabular-nums font-medium text-[#203653]">
+                          {v}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </section>
           </div>
 
           {/* Per-class Top Terms */}
-          <section className="rounded-xl border border-[#E2E8F0] bg-white p-6 space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <h2 className="font-display text-base font-semibold text-[#0F172A]">
-                Frequent Vocabulary by Class
-              </h2>
-              <div className="flex flex-wrap gap-1 rounded-lg bg-[#F1F5F9] p-1">
+          <section className="neu-card p-7 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="font-display text-base font-semibold text-[#203653]">
+                  Frequent Vocabulary by Class
+                </h2>
+                <p className="text-xs text-[#526783]">
+                  Most frequent non-stopword terms observed in each category of the active dataset.
+                </p>
+              </div>
+              <div className="neu-inset flex flex-wrap gap-1.5 p-1.5">
                 {datasetSummary.classCounts.map((c) => (
                   <button
                     key={c.label}
                     type="button"
                     onClick={() => setSelectedClass(c.label)}
-                    className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                    className={`rounded-xl px-3 py-1.5 text-xs font-medium transition-all ${
                       selectedClass === c.label
-                        ? 'bg-white text-[#0F2942] shadow-xs'
-                        : 'text-[#64748B] hover:text-[#0F172A]'
+                        ? 'neu-btn-accent text-[#203653]'
+                        : 'text-[#526783] hover:text-[#203653]'
                     }`}
                   >
                     {c.label}
@@ -398,20 +528,125 @@ export function DatasetAnalyticsPage({
               </div>
             </div>
 
-            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
+            <div className="grid gap-2.5 sm:grid-cols-2 lg:grid-cols-5">
               {(datasetSummary.topTermsByClass[selectedClass] ?? []).map((t) => (
                 <div
                   key={t.term}
-                  className="flex items-center justify-between rounded-lg bg-[#F8FAFC] px-3 py-2 text-xs"
+                  className="neu-inset flex items-center justify-between px-3.5 py-2.5 text-xs"
                 >
-                  <span className="font-mono text-[#0F172A]">{t.term}</span>
-                  <span className="font-mono tabular-nums text-[#64748B]">{t.frequency}</span>
+                  <span className="font-mono text-[#203653]">{t.term}</span>
+                  <span className="font-mono tabular-nums text-[#526783]">{t.frequency}</span>
                 </div>
               ))}
             </div>
           </section>
         </>
       )}
+
+      {/* Optional Advanced Options: Custom CSV Override */}
+      <details className="group neu-card">
+        <summary className="flex cursor-pointer list-none items-center justify-between px-7 py-5 text-xs font-semibold text-[#203653] select-none">
+          <span>Advanced Options (Inspect a Custom Labeled Dataset CSV)</span>
+          <ChevronDown className="h-4 w-4 text-[#4D6FAF] transition-transform group-open:rotate-180" />
+        </summary>
+
+        <div className="border-t border-[#AFC5F5]/55 p-7 space-y-4 text-xs">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-[#526783] max-w-2xl">
+              By default, Dataset Analytics loads the configured research corpus automatically. If you
+              want to audit or train on your own CSV file (<code className="font-mono">text</code>,{' '}
+              <code className="font-mono">label</code>, optional <code className="font-mono">split</code>),
+              load it here.
+            </p>
+            <label className="neu-btn inline-flex cursor-pointer items-center gap-2 px-4 py-2 font-medium whitespace-nowrap">
+              <Upload className="h-3.5 w-3.5 text-[#4D6FAF]" aria-hidden="true" />
+              <span>Select Custom Dataset CSV</span>
+              <input type="file" accept=".csv,text/csv" onChange={handleFileUpload} className="sr-only" />
+            </label>
+          </div>
+
+          {parsedCsv && (
+            <div className="pt-4 border-t border-[#AFC5F5]/55 grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+              <div>
+                <label htmlFor="dataset-name-input" className="block text-[#526783] mb-1">
+                  Dataset Name
+                </label>
+                <input
+                  id="dataset-name-input"
+                  type="text"
+                  value={datasetNameInput}
+                  onChange={(e) => handleMetadataChange(e.target.value, datasetSourceInput)}
+                  className="neu-input w-full px-3 py-1.5 text-xs text-[#203653]"
+                />
+              </div>
+              <div>
+                <label htmlFor="dataset-source-input" className="block text-[#526783] mb-1">
+                  Dataset Source / Citation
+                </label>
+                <input
+                  id="dataset-source-input"
+                  type="text"
+                  value={datasetSourceInput}
+                  onChange={(e) => handleMetadataChange(datasetNameInput, e.target.value)}
+                  className="neu-input w-full px-3 py-1.5 text-xs text-[#203653]"
+                />
+              </div>
+              <div>
+                <label htmlFor="corpus-text-col" className="block text-[#526783] mb-1">
+                  Text Column
+                </label>
+                <select
+                  id="corpus-text-col"
+                  value={textCol}
+                  onChange={(e) => handleRecompute(e.target.value, labelCol, splitCol)}
+                  className="neu-input w-full px-3 py-1.5 text-xs text-[#203653]"
+                >
+                  {parsedCsv.data.headers.map((h) => (
+                    <option key={h} value={h}>
+                      {h}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label htmlFor="corpus-label-col" className="block text-[#526783] mb-1">
+                  Label Column
+                </label>
+                <select
+                  id="corpus-label-col"
+                  value={labelCol}
+                  onChange={(e) => handleRecompute(textCol, e.target.value, splitCol)}
+                  className="neu-input w-full px-3 py-1.5 text-xs text-[#203653]"
+                >
+                  {parsedCsv.data.headers.map((h) => (
+                    <option key={h} value={h}>
+                      {h}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label htmlFor="corpus-split-col" className="block text-[#526783] mb-1">
+                  Split Column (Optional)
+                </label>
+                <select
+                  id="corpus-split-col"
+                  value={splitCol}
+                  onChange={(e) => handleRecompute(textCol, labelCol, e.target.value)}
+                  className="neu-input w-full px-3 py-1.5 text-xs text-[#203653]"
+                >
+                  <option value="">None (70/15/15 stratified plan)</option>
+                  {parsedCsv.data.headers.map((h) => (
+                    <option key={h} value={h}>
+                      {h}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          )}
+        </div>
+      </details>
     </div>
   );
 }

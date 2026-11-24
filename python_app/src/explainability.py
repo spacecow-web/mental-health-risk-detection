@@ -279,7 +279,10 @@ class ExplainabilityEngine:
         self.classifier = classifier
         self.config = config
         self.class_names = classifier.class_names
-        self._lime = LimeTextExplainer(class_names=self.class_names)
+        self._lime = LimeTextExplainer(
+            class_names=self.class_names,
+            split_expression=r"[^\w'\[\]]+",
+        )
         self._shap_masker = shap.maskers.Text(classifier.tokenizer)
         self._shap_explainer = shap.Explainer(
             classifier.predict_proba,

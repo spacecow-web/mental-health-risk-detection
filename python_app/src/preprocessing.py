@@ -138,10 +138,12 @@ def inspect_tokens(
     )
     input_ids: List[int] = encoded["input_ids"]
     tokens: List[str] = tokenizer.convert_ids_to_tokens(input_ids)
+    # Encode up to max_seq_length + 1 to detect truncation without triggering sequence-length warnings
+    probe_ids = tokenizer.encode(cleaned_text, truncation=True, max_length=max_seq_length + 1)
     return {
         "tokens": tokens,
         "input_ids": input_ids,
         "attention_mask": encoded["attention_mask"],
         "token_count": len(tokens),
-        "truncated": len(tokenizer.encode(cleaned_text, truncation=False)) > max_seq_length,
+        "truncated": len(probe_ids) > max_seq_length,
     }

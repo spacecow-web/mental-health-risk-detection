@@ -1,10 +1,9 @@
 export type PageId =
-  | 'overview'
-  | 'text-analysis'
-  | 'explainable-ai'
-  | 'model-performance'
-  | 'dataset-analytics'
-  | 'about-methodology';
+  | 'home'
+  | 'check-text'
+  | 'understand-result'
+  | 'about-project'
+  | 'project-details';
 
 export type TransformerBackbone = 'distilbert-base-uncased' | 'bert-base-uncased';
 
@@ -67,6 +66,21 @@ export interface InferenceExplanationBundle {
   naturalLanguageSummary: string;
   supportiveGuidance: boolean;
   confidenceDisclaimer?: string;
+  inferenceMode?: 'zero-shot' | 'fine-tuned';
+  appliedOptions?: PreprocessingOptions;
+}
+
+export interface CorpusRecord {
+  text: string;
+  label: string;
+  split?: string;
+}
+
+export interface LoadedCorpusData {
+  datasetName: string;
+  datasetSource: string;
+  fileName: string;
+  rows: CorpusRecord[];
 }
 
 export interface PerClassMetric {
@@ -148,6 +162,8 @@ export interface SplitBreakdownItem {
 
 export interface DatasetSummary {
   fileName: string;
+  datasetName: string;
+  datasetSource: string;
   totalRows: number;
   validRows: number;
   missingTextRows: number;
@@ -156,6 +172,9 @@ export interface DatasetSummary {
   shortTextCount: number;
   longTextCount: number;
   numClasses: number;
+  imbalanceRatio: number;
+  majorityClass: string;
+  minorityClass: string;
   classCounts: ClassCount[];
   splitBreakdown: SplitBreakdownItem[] | null;
   lengthStats: {
@@ -169,10 +188,21 @@ export interface DatasetSummary {
   topTermsByClass: Record<string, TermFrequency[]>;
 }
 
+export interface AvailableServerModel {
+  id: string;
+  name: string;
+  ready: boolean;
+  mode: 'zero-shot' | 'fine-tuned';
+  labels: string[];
+}
+
 export interface EndpointConfig {
+  mode: 'built-in' | 'external-python';
   url: string;
   status: 'unconfigured' | 'connected' | 'unreachable';
   backbone: TransformerBackbone;
+  activeServerModelId: string;
+  availableServerModels: AvailableServerModel[];
   detectedLabels: string[];
   lastError: string | null;
 }
